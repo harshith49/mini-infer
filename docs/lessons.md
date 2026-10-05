@@ -59,3 +59,15 @@ Final Git verification caught standard-library CSV CRLF endings as trailing whit
 ## Standalone repository correction — October 5, 2026
 
 The project now publishes to `harshith49/mini-infer` with engine, tests, benchmarks, and documentation at the repository root. Earlier milestones inherited an unrelated enclosing Git remote; that repository selection was a mistake. The completed M2 snapshot was independently verified with 98 passing tests and one CUDA hardware skip before migration. M3 implementation remains uncommitted work. Future milestone pushes use this project's own remote.
+
+## Milestone 3 — static batching
+
+- Left padding needs two coordinate systems: causal/cache offsets are physical columns, while learned positions count real tokens. Tiny and public GPT-2 suffix-logit comparisons cover both.
+- A leading padded query can have no legal keys. Finite-minimum score masking followed by explicitly zeroing blocked softmax probabilities keeps padded outputs finite and valid tokens independent of padding IDs.
+- EOS is row state: its selection remains a valid token, then later filler becomes masked. Controlled projections after real transformer forwards verify one row finishing at step one while another finishes at step three, including padding IDs that equal EOS.
+- The cache mask-required flag commits only with successful logits. A late projection exception leaves length, committed prefix, and flag reusable; omitted masks after padded commits reject clearly. Historical masks remain caller-owned and must preserve committed validity.
+- Prior logits are released before the next batch forward in both modes. Whole-batch validation and zero-output tests prove that invalid later prompts or no-work requests do not allocate caches or forward.
+- Public GPT-2 batch outputs match independent engine and HF greedy output for 50 tokens in both cache modes, with short/128-plus-token/Unicode prompts, three orders, and single-row batches. Full and cached suffix logits retain atol=rtol=1e-4.
+- Acceptance suite: 169 passed, two CUDA hardware skips. Real two-prompt cached and uncached CLI runs produce matching JSON continuations; compileall and whitespace checks pass. GPU parity and batch throughput remain unmeasured. Existing M2 CSV data is unchanged.
+
+Implementation stayed native with project-local scratch tracking. Batch-loop tests were split into a focused file rather than adding them to the model-mask tests. Repository migration corrected the inherited remote; active work now uses standalone mini-infer on codex/mini-infer-m3.

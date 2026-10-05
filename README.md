@@ -4,7 +4,7 @@ LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that
 
 A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and measured CPU KV-cache benchmarks.
 
-**Current status: Milestone 2, KV caching.** The custom GPT-2 transformer supports an uncached correctness baseline and optional contiguous KV caching. Both match Hugging Face greedy tokens on CPU. Naive-versus-cached CPU measurements are published below; batching and serving come later.
+**Current status: Milestone 3, static batching.** The custom GPT-2 transformer supports independent and fixed-batch generation, with optional contiguous KV caching. Different-length batch rows match independent Hugging Face greedy tokens on CPU. Naive-versus-cached single-request CPU measurements are published below; batch throughput remains unmeasured and serving comes later.
 
 ## Quick start
 
@@ -53,6 +53,29 @@ output = generate(model, ids, 50, use_cache=True)  # no EOS stopping: exactly 50
 print(tokenizer.decode(output[0].tolist()))
 ```
 
+## Static batching
+
+Repeat `--prompt` to generate a fixed batch. Output is a JSON list in input order:
+
+```bash
+python -m engine.batching --prompt "Hello" --prompt "The quick brown fox" --max-new-tokens 50 --device cpu --use-cache
+```
+
+Omit `--use-cache` for the independent uncached execution path. Each original prompt is preserved verbatim, including Unicode, newlines, and literal special-token text. Empty text uses the same EOS/BOS seed as the single-request CLI.
+
+```python
+from engine.batching import generate_batch
+
+prompts = [tokenizer(text, return_tensors="pt")["input_ids"][0].to(model.token_embedding.weight.device)
+           for text in ["Hello", "The quick brown fox"]]
+outputs = generate_batch(model, prompts, 50, pad_token_id=tokenizer.eos_token_id, use_cache=True)
+# Outputs are rank-1 IDs, original unpadded prompt plus exactly 50 new tokens.
+```
+
+The API accepts nonempty rank-1 token tensors on the model device and a common output budget. Set `eos_token_id` to stop each row at its first generated EOS (included in the result). Finished rows keep their batch slots while other rows continue; their later filler is masked and excluded from results. Padding and genuine tokens may share an ID because the mask determines validity.
+
+Prompts are left-padded, and learned positions count real tokens. Cache capacity is `longest_prompt_length + max_new_tokens` for every row, including padding; this full physical budget must fit the 1,024-token context. GPT-2 FP32 reservation is `batch_size × capacity × 73,728` bytes. Batch speedup and process peak memory have not been measured.
+
 ## Architecture
 
 ```mermaid
@@ -78,7 +101,9 @@ The engine uses transformers only to load weights/configuration and tokenize tex
 
 ## Correctness
 
-`tests/test_correctness_vs_hf.py` loads actual public `gpt2`, compares full FP32 logits using `atol=1e-4, rtol=1e-4`, and checks token-exact greedy decoding for **50 new tokens on each of three prompts**. Prompts cover punctuation, multiple lengths, Unicode, newlines, and spaces. Both models use evaluation mode; the reference uses eager attention and disables caching and EOS stopping for fixed-length comparisons.
+`tests/test_correctness_vs_hf.py` loads actual public `gpt2`, compares full FP32 logits using `atol=1e-4, rtol=1e-4`, and checks token-exact greedy decoding for **50 new tokens on each of three prompts**. Prompts cover punctuation, multiple lengths, Unicode, newlines, and spaces. Both models use evaluation mode; the reference uses eager attention and disables EOS stopping for fixed-length comparisons. The original baseline reference disables caching; batch acceptance also checks against cached HF generation.
+
+Batch checks compare each row against independent engine and HF output for 50 tokens, in cached and uncached modes, including a prompt over 128 tokens, three prompt orders, and a single-row batch. Padded full and cached suffix logits match independent references at the same tolerance. Tiny models cover fully blocked leading queries, logical positions, independent EOS completion, padding invariance, invalid inputs, cache retry metadata, and logits lifetime.
 
 On the verified CPU run, maximum absolute logit error was **0** for all three prompts. Cached token/chunk logits satisfy the same tolerance, and cached 50-token outputs match both the baseline and HF on all three prompts. The suite also tests offset causal masking, tied weights, checkpoint validation, cache capacity/byte accounting, failed-forward retry, context bounds, EOS termination, empty CLI prompts, and device selection. Public-weight tests are mandatory and fail if weights cannot be loaded. Only CUDA-specific tests skip when hardware is unavailable. CUDA numerical parity remains unverified here.
 
@@ -90,7 +115,7 @@ Run the same suite after every later milestone. Preserve this uncached baseline 
 |---|---|---|---|
 | Naive GPT-2 | 14.56 tokens/s | Not measured | Implemented and checked on CPU |
 | KV cache | 108.49 tokens/s | Not measured | Implemented and checked on CPU |
-| Static batching | Not measured | Not measured | Planned |
+| Static batching | Not measured | Not measured | Implemented and checked on CPU |
 | Continuous batching | Not measured | Not measured | Planned |
 | Paged KV | Not measured | Not measured | Planned |
 | int8 weights | Not measured | Not measured | Planned |
@@ -130,6 +155,6 @@ This is a learning project, not production-ready. Only standard GPT-2 inference 
 
 ## What I learned / what broke
 
-[The lessons log](docs/lessons.md) records actual implementation problems, fixes, and verification results. The [Milestone 1 design](docs/superpowers/specs/2026-10-05-mini-infer-m1-design.md) and [implementation plan](docs/superpowers/plans/2026-10-05-mini-infer-m1.md) explain the baseline scope. The [Milestone 2 design](docs/superpowers/specs/2026-10-05-mini-infer-m2-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m2.md) cover cached generation and measurements.
+[The lessons log](docs/lessons.md) records actual implementation problems, fixes, and verification results. The [Milestone 1 design](docs/superpowers/specs/2026-10-05-mini-infer-m1-design.md) and [implementation plan](docs/superpowers/plans/2026-10-05-mini-infer-m1.md) explain the baseline scope. The [Milestone 2 design](docs/superpowers/specs/2026-10-05-mini-infer-m2-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m2.md) cover cached generation and measurements. The [Milestone 3 design](docs/superpowers/specs/2026-10-05-mini-infer-m3-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m3.md) cover static batching.
 
 Code license: [MIT](LICENSE). Downloaded weights remain subject to their upstream license and are not included in this repository.
