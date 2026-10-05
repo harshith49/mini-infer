@@ -1,6 +1,6 @@
 # mini-infer Milestone 3 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for the retained native execution method. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for the retained native execution method. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Generate different-length prompts in a fixed batch with exactly the same greedy token IDs as independent requests.
 
@@ -43,14 +43,14 @@
 - Masks are same-device rank-2 Boolean or integer 0/1 tensors shaped `[batch, cache.length + new_length]`, with at least one real key in each row. Explicit positions are same-device `torch.long` shaped `[batch, new_length]`, within `[0, max_positions)`.
 - Derive implicit logical positions from full-mask cumulative counts minus one, zero masked positions, and take the new chunk suffix. Retain physical offset positions when neither mask nor positions is supplied.
 
-- [ ] Write tiny-model tests with vocabulary 37, context 16, hidden size 24, two layers, four heads, and intermediate size 96. For IDs `[[0,0,1],[2,3,4]]`, mask `[[0,0,1],[1,1,1]]`, compare valid logits to individual forwards and explicit positions `[[0,0,0],[0,1,2]]` at `atol=1e-4, rtol=1e-4`. Assert every output is finite and changing masked token IDs leaves valid logits unchanged.
-- [ ] Add cache tests: padded prefill of width three followed by a two-token chunk matches each independent five/three-token logical sequence's suffix logits; cache length becomes five and byte counts include physical padding. Exercise exact capacity and explicit position IDs without a mask.
-- [ ] Add parameterized rejection tests for wrong mask rank/length/batch/device, floating masks, nonbinary integers, all-zero rows, bad position rank/shape/dtype/device/range, and exhausted context/capacity. Snapshot committed prefixes, length, and flag and assert no change. Use a meta-device tensor for same-device validation without requiring CUDA.
-- [ ] Add missing-mask and late-projection-failure tests. After successful padded prefill, omitted mask raises without changes. Starting with an unmasked committed prefix, inject a projection exception during a masked extension; flag and prefix stay unchanged. Retry with the full valid mask, compare suffix logits to a full forward, and assert the flag commits only on success.
-- [ ] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_batching.py tests/test_kv_cache.py -q`; require failures from missing new arguments or metadata before implementation.
-- [ ] Implement validation before transformer writes and combine causal visibility with key validity. On the masked path, softmax finite-minimum masked scores and explicitly zero blocked probabilities, including all-blocked padded queries. Preserve the no-mask operations and commit cache length/flag only after logits succeed.
-- [ ] Run the full suite with `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest -q`; require all CPU checks to pass and hardware-dependent CUDA checks to skip only when unavailable.
-- [ ] Commit with `feat: add padding masks and logical positions to GPT-2`.
+- [x] Write tiny-model tests with vocabulary 37, context 16, hidden size 24, two layers, four heads, and intermediate size 96. For IDs `[[0,0,1],[2,3,4]]`, mask `[[0,0,1],[1,1,1]]`, compare valid logits to individual forwards and explicit positions `[[0,0,0],[0,1,2]]` at `atol=1e-4, rtol=1e-4`. Assert every output is finite and changing masked token IDs leaves valid logits unchanged.
+- [x] Add cache tests: padded prefill of width three followed by a two-token chunk matches each independent five/three-token logical sequence's suffix logits; cache length becomes five and byte counts include physical padding. Exercise exact capacity and explicit position IDs without a mask.
+- [x] Add parameterized rejection tests for wrong mask rank/length/batch/device, floating masks, nonbinary integers, all-zero rows, bad position rank/shape/dtype/device/range, and exhausted context/capacity. Snapshot committed prefixes, length, and flag and assert no change. Use a meta-device tensor for same-device validation without requiring CUDA.
+- [x] Add missing-mask and late-projection-failure tests. After successful padded prefill, omitted mask raises without changes. Starting with an unmasked committed prefix, inject a projection exception during a masked extension; flag and prefix stay unchanged. Retry with the full valid mask, compare suffix logits to a full forward, and assert the flag commits only on success.
+- [x] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_batching.py tests/test_kv_cache.py -q`; require failures from missing new arguments or metadata before implementation.
+- [x] Implement validation before transformer writes and combine causal visibility with key validity. On the masked path, softmax finite-minimum masked scores and explicitly zero blocked probabilities, including all-blocked padded queries. Preserve the no-mask operations and commit cache length/flag only after logits succeed.
+- [x] Run the full suite with `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest -q`; require all CPU checks to pass and hardware-dependent CUDA checks to skip only when unavailable.
+- [x] Commit with `feat: add padding masks and logical positions to GPT-2`.
 
 ## Task 2: Fixed-batch generation and CLI
 
@@ -61,15 +61,15 @@
 - Consume Task 1's masked forward and cache flag; reuse `engine.sampler.greedy`, `load_model(EngineConfig(...))`, and `SimpleKVCache`. Leave `engine.generate.generate` independent.
 - CLI `main() -> None`: repeated required `--prompt`, `--max-new-tokens` default 50, `--device` choices auto/cpu/cuda, and `--use-cache`. Seed empty text with tokenizer EOS/BOS; print a JSON list with `ensure_ascii=False`, raw original prompt plus only decoded new IDs.
 
-- [ ] Add real tiny-model tests in both cache modes: unequal prompts equal independent `generate` results; single-row batch works; output order survives reordered prompts; pad ID may equal a genuine prompt token or EOS. Assert exact output count with EOS disabled.
-- [ ] Observe real forward input lengths: width-three prompts and four outputs give cached `[3,1,1,1]` and uncached `[3,4,5,6]`; capture masks to assert leading padding remains blocked. Use a weak reference to the prior logits and assert it is dead at the next forward.
-- [ ] Add independent EOS tests using a controlled final-logit projection after real transformer forwards: row zero selects EOS at step one, row one at step three. Assert result lengths are prompt lengths plus one/three, both include EOS, exactly three batch forwards occur, terminal EOS keys stay valid, and later filler for row zero is masked. Add all-rows-EOS-first-step stopping.
-- [ ] Add rejection tests for empty list, empty/wrong-rank/wrong-dtype/wrong-device/invalid-ID later prompts, negative or noninteger output budget, invalid pad/EOS IDs, and longest-prompt-plus-budget overflow. A forward observer and allocation spy must see zero calls on rejected or zero-output requests; zero outputs return unchanged valid prompts.
-- [ ] Add CLI tests for repeated prompts, empty prompt seeding, Unicode/newlines, zero outputs, literal `<|endoftext|>` preservation, and negative-budget argparse errors. Decode only the generated suffix and parse output with `json.loads` to check order and exact original prefixes.
-- [ ] Run targeted tests; require failures from the missing batch API/CLI before implementation.
-- [ ] Implement upfront validation, left padding, full mask history, and one forward per iteration. Allocate cache capacity `longest_prompt_length + max_new_tokens`. Track active rows and actual output lengths; append EOS as valid on its selection step, then mask filler on later steps. Release logits immediately after selection and never forward the final sampled tokens unnecessarily.
-- [ ] Implement the CLI using the existing loader/device behavior and JSON output contract.
-- [ ] Run the full suite and commit with `feat: generate fixed batches of different-length prompts`.
+- [x] Add real tiny-model tests in both cache modes: unequal prompts equal independent `generate` results; single-row batch works; output order survives reordered prompts; pad ID may equal a genuine prompt token or EOS. Assert exact output count with EOS disabled.
+- [x] Observe real forward input lengths: width-three prompts and four outputs give cached `[3,1,1,1]` and uncached `[3,4,5,6]`; capture masks to assert leading padding remains blocked. Use a weak reference to the prior logits and assert it is dead at the next forward.
+- [x] Add independent EOS tests using a controlled final-logit projection after real transformer forwards: row zero selects EOS at step one, row one at step three. Assert result lengths are prompt lengths plus one/three, both include EOS, exactly three batch forwards occur, terminal EOS keys stay valid, and later filler for row zero is masked. Add all-rows-EOS-first-step stopping.
+- [x] Add rejection tests for empty list, empty/wrong-rank/wrong-dtype/wrong-device/invalid-ID later prompts, negative or noninteger output budget, invalid pad/EOS IDs, and longest-prompt-plus-budget overflow. A forward observer and allocation spy must see zero calls on rejected or zero-output requests; zero outputs return unchanged valid prompts.
+- [x] Add CLI tests for repeated prompts, empty prompt seeding, Unicode/newlines, zero outputs, literal `<|endoftext|>` preservation, and negative-budget argparse errors. Decode only the generated suffix and parse output with `json.loads` to check order and exact original prefixes.
+- [x] Run targeted tests; require failures from the missing batch API/CLI before implementation.
+- [x] Implement upfront validation, left padding, full mask history, and one forward per iteration. Allocate cache capacity `longest_prompt_length + max_new_tokens`. Track active rows and actual output lengths; append EOS as valid on its selection step, then mask filler on later steps. Release logits immediately after selection and never forward the final sampled tokens unnecessarily.
+- [x] Implement the CLI using the existing loader/device behavior and JSON output contract.
+- [x] Run the full suite and commit with `feat: generate fixed batches of different-length prompts`.
 
 ## Task 3: Public-model parity, documentation, and release
 
