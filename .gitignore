@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.superpowers/
+.env
+.env.*
+!.env.example
+model_cache/
+*.safetensors
+*.bin
+*.pt
+*.pth
+results/*.png
