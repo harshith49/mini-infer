@@ -71,3 +71,9 @@ The project now publishes to `harshith49/mini-infer` with engine, tests, benchma
 - Acceptance suite: 169 passed, two CUDA hardware skips. Real two-prompt cached and uncached CLI runs produce matching JSON continuations; compileall and whitespace checks pass. GPU parity and batch throughput remain unmeasured. Existing M2 CSV data is unchanged.
 
 Implementation stayed native with project-local scratch tracking. Batch-loop tests were split into a focused file rather than adding them to the model-mask tests. Repository migration corrected the inherited remote; active work now uses standalone mini-infer on codex/mini-infer-m3.
+
+### Milestone 3 final review
+
+The fresh independent reviewer reran the suite (169 passed, two CUDA skips) and found no critical or important issues. It identified one stale README limitation describing only single-request generation; corrected it because the user explicitly requested an accurate project description. No engine fix was needed. No findings remain deferred.
+
+Decisions: retain project-local scratch tracking (manual ledger must remain accurate), separate batch-loop tests (small fixture duplication), and standalone repository identity (local folder remains in its original filesystem location). Historical masks stay caller-owned (mutating old validity can invalidate cached states); CUDA remains unverified (device-specific discrepancies need hardware); batch performance/compaction/admission remain future work (padded and finished rows waste compute). Nonfinite/corrupted weights and differentiable cache training remain outside the supported inference lifecycle (they need separate numerical and autograd validation).

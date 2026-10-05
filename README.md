@@ -151,7 +151,7 @@ Only the naive-versus-KV benchmark is implemented. Charts, HF/vLLM comparisons, 
 
 ## Honest limitations
 
-This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation handles one unpadded request. The default baseline recomputes the full prefix; `--use-cache` enables fixed-capacity contiguous request storage. Caching still reads previous keys and values, reserves the full requested budget, and has no paging or scheduler. No custom kernels, distributed execution, stochastic sampling, quantization, or server exist yet. No comparison against vLLM has been measured.
+This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports one unpadded request or a fixed batch of different-length prompts with a shared output budget. The default baseline recomputes the full prefix; `--use-cache` enables fixed-capacity contiguous request storage. Caching still reads previous keys and values, reserves the full requested budget, and has no paging or scheduler. No custom kernels, distributed execution, stochastic sampling, quantization, or server exist yet. No comparison against vLLM has been measured.
 
 ## What I learned / what broke
 
