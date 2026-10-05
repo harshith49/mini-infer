@@ -22,7 +22,7 @@ class CausalAttention(nn.Module):
             persistent=False)
 
     def forward(self, x: torch.Tensor, *, cache: SimpleKVCache | None = None,
-                layer_idx: int = 0) -> torch.Tensor:
+                layer_idx: int = 0, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         batch, length, width = x.shape
         # Heads carry independent dot products: [batch, heads, tokens, head_dim].
         q, k, v = (part.view(batch, length, self.num_heads, self.head_dim)
@@ -35,9 +35,16 @@ class CausalAttention(nn.Module):
         # Queries have absolute positions past..past+length: chunk-local mask
         # rows would hide the cached prefix and break multi-token chunked prefill.
         # Mask before softmax so future keys get exactly zero attention weight.
-        scores = scores.masked_fill(~self.causal_mask[past:past + length, :past + length],
-                                    torch.finfo(scores.dtype).min)
-        attended = torch.matmul(torch.softmax(scores, dim=-1), v)
+        allowed = self.causal_mask[past:past + length, :past + length]
+        if attention_mask is not None:
+            allowed = allowed[None, None] & attention_mask[:, None, None, :].bool()
+        scores = scores.masked_fill(~allowed, torch.finfo(scores.dtype).min)
+        probabilities = torch.softmax(scores, dim=-1)
+        if attention_mask is not None:
+            # All-blocked leading queries must have zero weights, not a uniform
+            # distribution over padding (or NaN from softmax of -infinity).
+            probabilities = probabilities.masked_fill(~allowed, 0)
+        attended = torch.matmul(probabilities, v)
         return self.projection(attended.transpose(1, 2).contiguous()
                                .view(batch, length, width))
 
@@ -65,13 +72,14 @@ class TransformerBlock(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor, *, cache: SimpleKVCache | None = None,
-                layer_idx: int = 0) -> torch.Tensor:
-        x = x + self.attention(self.attention_norm(x), cache=cache, layer_idx=layer_idx)
+                layer_idx: int = 0, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = x + self.attention(self.attention_norm(x), cache=cache, layer_idx=layer_idx,
+                               attention_mask=attention_mask)
         return x + self.mlp(self.mlp_norm(x))
 
 
 class GPT2Model(nn.Module):
-    """Unpadded GPT-2 inference; logits have shape [batch, tokens, vocabulary]."""
+    """GPT-2 inference; logits have shape [batch, tokens, vocabulary]."""
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
@@ -93,18 +101,48 @@ class GPT2Model(nn.Module):
             raise ValueError("input_ids contains a token outside the vocabulary")
 
     def forward(self, input_ids: torch.Tensor, *,
-                cache: SimpleKVCache | None = None) -> torch.Tensor:
+                cache: SimpleKVCache | None = None,
+                attention_mask: torch.Tensor | None = None,
+                position_ids: torch.Tensor | None = None) -> torch.Tensor:
         self.validate_input_ids(input_ids)
+        if input_ids.device != self.token_embedding.weight.device:
+            raise ValueError("input_ids must be on the model device")
         if cache is not None:
             cache.validate(self.config, input_ids, device=self.token_embedding.weight.device,
                            dtype=self.token_embedding.weight.dtype)
         past = cache.length if cache is not None else 0
-        positions = torch.arange(past, past + input_ids.shape[1], device=input_ids.device)
+        if past + input_ids.shape[1] > self.config.max_positions:
+            raise ValueError("Request exceeds model context limit")
+        if cache is not None and cache.requires_attention_mask and attention_mask is None:
+            raise ValueError("attention_mask is required after masked cache keys are committed")
+        if attention_mask is not None:
+            integer_dtypes = (torch.bool, torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+            if (attention_mask.device != input_ids.device
+                    or attention_mask.dtype not in integer_dtypes
+                    or attention_mask.shape != (input_ids.shape[0], past + input_ids.shape[1])):
+                raise ValueError("attention_mask must be a same-device binary rank-2 tensor covering all keys")
+            if (torch.any((attention_mask != 0) & (attention_mask != 1))
+                    or not torch.all(attention_mask.bool().any(dim=1))):
+                raise ValueError("attention_mask must be binary with at least one real key per row")
+        if position_ids is not None:
+            if (position_ids.device != input_ids.device or position_ids.dtype != torch.long
+                    or position_ids.shape != input_ids.shape):
+                raise ValueError("position_ids must be same-device torch.long with the input shape")
+            if torch.any(position_ids < 0) or torch.any(position_ids >= self.config.max_positions):
+                raise ValueError("position_ids must fit the learned position range")
+            positions = position_ids
+        elif attention_mask is not None:
+            positions = (attention_mask.long().cumsum(-1) - 1).masked_fill(~attention_mask.bool(), 0)
+            positions = positions[:, -input_ids.shape[1]:]
+        else:
+            positions = torch.arange(past, past + input_ids.shape[1], device=input_ids.device)
         x = self.token_embedding(input_ids) + self.position_embedding(positions)
         for layer_idx, block in enumerate(self.blocks):
-            x = block(x, cache=cache, layer_idx=layer_idx)
+            x = block(x, cache=cache, layer_idx=layer_idx, attention_mask=attention_mask)
         logits = self.lm_head(self.final_norm(x))
         if cache is not None:
             # Commit once, after every layer and the vocabulary projection succeed.
             cache.length += input_ids.shape[1]
+            if attention_mask is not None and not torch.all(attention_mask.bool()):
+                cache.requires_attention_mask = True
         return logits

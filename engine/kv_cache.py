@@ -22,6 +22,7 @@ class SimpleKVCache:
         self.config = config
         self.capacity = capacity
         self.length = 0
+        self.requires_attention_mask = False
         shape = (config.num_layers, batch_size, config.num_heads, capacity,
                  config.hidden_size // config.num_heads)
         self.keys = torch.empty(shape, device=device, dtype=dtype)

@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Continue in the standalone `mini-infer` project on `codex/mini-infer-m1`, publishing verified milestone commits to `harshith49/mini-infer`.
+- Continue in the standalone `mini-infer` project on `codex/mini-infer-m3`, publishing verified milestone commits to `harshith49/mini-infer`.
 - Keep unrelated files, model downloads, environments, and credentials out of commits. No automatic merge or force push.
 - Retain all Milestone 1/2 correctness checks, and keep CPU mandatory with CUDA conditional on hardware.
 - Valid-token logits must match individual unpadded forwards using `atol=1e-4, rtol=1e-4`; actual public GPT-2 greedy comparisons require at least 50 new tokens and exact token equality.
@@ -85,7 +85,7 @@
 - [ ] Update README and architecture Mermaid with left padding, real-token positions, fixed slots, masked filler, result order, and cache reservations including padding. Document common budgets, caller-owned historical masks, and unmeasured batching performance; preserve M2 CSV and GPU labels. Record actual findings in lessons.
 - [ ] Run `HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 .venv/bin/python -m engine.batching --prompt 'Hello' --prompt 'The quick brown fox' --max-new-tokens 50 --device cpu --use-cache` and the uncached equivalent; parse the JSON and confirm matching continuations.
 - [ ] Run the full suite, `.venv/bin/python -m compileall -q engine benchmarks`, and `git diff --check` (also staged diff when staging new files). Request one fresh independent read-only reviewer under native execution. Fix important findings with reproducing tests and a green full suite.
-- [ ] Commit with `test: verify public GPT-2 static batch parity`, push the verified milestone to `origin/codex/mini-infer-m1`, and confirm local/remote HEAD match. Remove milestone scratch tracking after completion; no merge or force push.
+- [ ] Commit with `test: verify public GPT-2 static batch parity`, push the verified milestone to `origin/codex/mini-infer-m3`, and confirm local/remote HEAD match. Remove milestone scratch tracking after completion; no merge or force push.
 
 ## Plan self-review
 
