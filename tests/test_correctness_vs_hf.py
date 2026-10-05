@@ -168,3 +168,87 @@ def test_public_gpt2_cached_suffix_logits(public_models, prompt):
             torch.testing.assert_close(actual, expected[:, offset:offset + size],
                                        atol=1e-4, rtol=1e-4)
             offset += size
+
+
+@pytest.fixture(scope='session')
+def public_batch_cases(public_models):
+    model, reference, tokenizer = public_models
+    texts = [PROMPTS[0], PROMPTS[2], 'The quick brown fox jumps over the lazy dog. ' * 13]
+    prompts = [tokenizer(text, return_tensors='pt')['input_ids'][0] for text in texts]
+    assert len(prompts[2]) >= 128
+    expected = []
+    from engine.generate import generate
+    with torch.inference_mode():
+        for prompt in prompts:
+            hf = reference.generate(prompt[None], attention_mask=torch.ones_like(prompt[None]),
+                max_new_tokens=50, do_sample=False, use_cache=True, eos_token_id=None,
+                pad_token_id=tokenizer.eos_token_id)[0]
+            assert len(hf) == len(prompt) + 50
+            for use_cache in [False, True]:
+                assert torch.equal(generate(model, prompt[None], 50, use_cache=use_cache)[0], hf)
+            expected.append(hf)
+    return prompts, expected
+
+
+@torch.inference_mode()
+def test_public_gpt2_masked_full_and_cached_suffix_logits(public_models):
+    from engine.kv_cache import SimpleKVCache
+    model, reference, tokenizer = public_models
+    prompts = [tokenizer(text, return_tensors='pt')['input_ids'][0] for text in PROMPTS]
+    width = max(map(len, prompts))
+    ids = torch.full((len(prompts), width), tokenizer.eos_token_id, dtype=torch.long)
+    mask = torch.zeros_like(ids, dtype=torch.bool)
+    for row, prompt in enumerate(prompts):
+        ids[row, -len(prompt):] = prompt
+        mask[row, -len(prompt):] = True
+    positions = (mask.long().cumsum(-1) - 1).masked_fill(~mask, 0)
+    actual = model(ids, attention_mask=mask)
+    padded_reference = reference(ids, attention_mask=mask, position_ids=positions, use_cache=False).logits
+    cache = SimpleKVCache(model.config, batch_size=len(prompts), capacity=width+2,
+        device=torch.device('cpu'), dtype=torch.float32)
+    model(ids, cache=cache, attention_mask=mask)
+    suffix = torch.tensor([[15496, 11]] * len(prompts))
+    cached = model(suffix, cache=cache,
+        attention_mask=torch.cat((mask, torch.ones_like(suffix, dtype=torch.bool)), dim=1))
+    for row, prompt in enumerate(prompts):
+        hf = reference(prompt[None], use_cache=False).logits[0]
+        solo = model(prompt[None])[0]
+        for expected in [hf, solo, padded_reference[row, -len(prompt):]]:
+            torch.testing.assert_close(actual[row, -len(prompt):], expected, atol=1e-4, rtol=1e-4)
+        complete = torch.cat((prompt, suffix[row]))[None]
+        for expected in [model(complete)[0, -2:], reference(complete, use_cache=False).logits[0, -2:]]:
+            torch.testing.assert_close(cached[row], expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize('use_cache', [False, True])
+@pytest.mark.parametrize('order', [[0, 1, 2], [2, 1, 0], [1, 2, 0], [1]])
+def test_public_gpt2_batch_greedy_50_tokens(public_models, public_batch_cases, use_cache, order):
+    from engine.batching import generate_batch
+    model, _, tokenizer = public_models
+    prompts, expected = public_batch_cases
+    actual = generate_batch(model, [prompts[i] for i in order], 50,
+                            pad_token_id=tokenizer.eos_token_id, use_cache=use_cache)
+    assert len(actual) == len(order)
+    for row, index in zip(actual, order):
+        assert len(row) == len(prompts[index]) + 50
+        assert torch.equal(row, expected[index])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA hardware unavailable')
+@torch.inference_mode()
+def test_public_gpt2_cuda_batch_parity(public_models):
+    import copy
+    from engine.batching import generate_batch
+    model, _, tokenizer = public_models
+    cuda_model = copy.deepcopy(model).to('cuda').eval()
+    prompts = [tokenizer(text, return_tensors='pt')['input_ids'][0] for text in PROMPTS[:2]]
+    cuda_prompts = [prompt.to('cuda') for prompt in prompts]
+    for use_cache in [False, True]:
+        cpu = generate_batch(model, prompts, 50, pad_token_id=tokenizer.eos_token_id, use_cache=use_cache)
+        gpu = generate_batch(cuda_model, cuda_prompts, 50, pad_token_id=tokenizer.eos_token_id, use_cache=use_cache)
+        assert all(torch.equal(a, b.cpu()) for a, b in zip(cpu, gpu))
+    ids = torch.tensor([[0, 0, 1], [2, 3, 4]])
+    mask = torch.tensor([[0, 0, 1], [1, 1, 1]], dtype=torch.bool)
+    torch.testing.assert_close(model(ids, attention_mask=mask),
+        cuda_model(ids.cuda(), attention_mask=mask.cuda()).cpu(), atol=1e-4, rtol=1e-4)
+    assert model.token_embedding.weight.device.type == 'cpu'

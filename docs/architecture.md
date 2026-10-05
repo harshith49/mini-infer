@@ -4,7 +4,7 @@ The engine implements GPT-2 small using PyTorch tensors and modules. Hugging Fac
 
 ```mermaid
 flowchart TD
-    IDs[Unpadded token IDs] --> Emb[Token + learned position embeddings]
+    IDs[Token IDs and optional padding mask] --> Emb[Token + learned real-token position embeddings]
     Emb --> LN1[LayerNorm]
     LN1 --> Attn[Causal multi-head self-attention]
     Attn --> R1[Residual addition]
@@ -19,7 +19,7 @@ flowchart TD
     Head --> Logits[Logits for every position]
 ```
 
-Each attention head computes `softmax(QKᵀ / sqrt(head_dim))V`. Queries and keys have shape `[batch, heads, tokens, head_dim]`. A lower-triangular mask removes future keys before softmax. No left padding or attention-mask API is supported yet. Position IDs are learned indices starting at zero.
+Each attention head computes `softmax(QKᵀ / sqrt(head_dim))V`. Queries and keys have shape `[batch, heads, tokens, head_dim]`. A lower-triangular mask removes future keys before softmax; an optional binary key mask also removes padding. Fully blocked leading padded queries have zero attention probabilities and finite outputs. Without a mask, position IDs are physical indices; with a mask, they count real tokens starting at zero. Explicit per-row position IDs can override this derivation.
 
 GPT-2's Hugging Face Conv1D weights use `[input, output]`; PyTorch Linear uses `[output, input]`. `weights.py` first rejects HF loading diagnostics that indicate absent/randomly initialized parameters, then validates the entire mapping before copying, transposing all projection weights even when square. Embedding and normalization weights copy directly. The language-model head shares the token embedding parameter rather than storing a second vocabulary matrix.
 
@@ -67,11 +67,36 @@ sequenceDiagram
 
 `SimpleKVCache` owns key and value tensors with shape `[layers, batch, heads, capacity, head_dim]`. It is separate from the model/checkpoint. GPT-2 FP32 cache storage costs `2 × 12 × 768 × 4 = 73,728` bytes per reserved token per request. Capacity is fixed for the request, so **allocated bytes** stay constant while **used bytes** grow with committed token count. Normal generation reserves prompt plus output budget; the last sampled token need not be forwarded, so it does not need a committed KV slot. EOS may leave more unused capacity.
 
-Absolute position IDs start at `cache.length`. A chunk of length `n` after a prefix of length `p` uses causal-mask rows `p:p+n` and key columns `:p+n`. Using rows starting at zero would wrongly hide past keys and mis-mask a multi-token chunk. Both one-token decode and chunked prefill are tested.
+Without a padding mask, absolute position IDs start at `cache.length`. A chunk of length `n` after a physical prefix of length `p` uses causal-mask rows `p:p+n` and key columns `:p+n`. Using rows starting at zero would wrongly hide past keys and mis-mask a multi-token chunk. With a mask, learned positions count valid tokens separately from physical cache length. Both one-token decode and chunked prefill are tested.
 
 Every layer writes tentatively at the same committed offset; the model advances the length only after the final logits succeed. A failed late layer leaves the earlier committed prefix intact. Retrying overwrites tentative slots. Dimensions, batch, dtype/device, and capacity are validated before the first write. This cache stores inference state and does not support differentiable training through cached keys/values.
 
-Caching saves repeated projections and MLP computation for old tokens, but attention still reads all previous keys and values. Contiguous allocation reserves the full request budget; it does not solve padding, admission, or fragmentation. Those belong to later batching and paging milestones.
+Caching saves repeated projections and MLP computation for old tokens, but attention still reads all previous keys and values. Contiguous allocation reserves the full request budget, including padding in static batches. Admission, removal of completed rows, and fragmentation remain later scheduling and paging work.
+
+## Fixed-batch generation
+
+```mermaid
+flowchart TD
+    Prompts[Different-length prompts in input order] --> Pad[Left-pad IDs and build binary key mask]
+    Pad --> Positions[Learned positions count real tokens]
+    Positions --> Forward[One batch forward per step]
+    Mask[Full key mask including cached history] --> Forward
+    Forward --> Select[Select final-position greedy IDs]
+    Select --> Rows[Record first EOS per row; mask later filler]
+    Rows --> Done{All finished or budget reached?}
+    Done -->|no| Next[Cached: one column / uncached: whole history]
+    Next --> Forward
+    Rows --> Mask
+    Done -->|yes| Output[Trim padding and filler; preserve request order]
+```
+
+`generate_batch()` validates every prompt, token ID, and physical output budget before allocating or forwarding. It left-pads to the longest prompt, reserves that width plus the shared output budget for each row, and keeps the batch fixed. With EOS disabled each row gets exactly the requested count; otherwise each row includes its own first new EOS and excludes subsequent filler. Zero outputs return original prompt tensors without a forward or cache allocation. Previous vocabulary logits are released before the next forward in both modes.
+
+The masked model API requires a same-device Boolean or integer 0/1 mask covering all physical keys, including the committed cache prefix. Each row must have a real key; chunked prefill that contains only padding for a row is rejected. Derived positions are `cumsum(mask) - 1`, with masked positions set to zero, taking the new chunk suffix. Explicit positions are same-device `torch.long` tensors matching the current input shape and learned range.
+
+After masked keys commit, `cache.requires_attention_mask` prevents later calls from exposing them by omitting the mask. This flag commits with length after successful logits, and a failed forward leaves committed metadata/prefix reusable. The caller must preserve historical key validity: changing an old mask is unsupported because cached hidden states were computed under that mask. The batch loop owns the full mask history; the cache does not store another mask tensor.
+
+Allocated/used byte counts include physical padding and forwarded filler slots, even though masked slots cannot influence valid tokens. There is no row compaction, admission queue, per-request budget, or measured batch speedup in this milestone.
 
 ## Measurement scope
 

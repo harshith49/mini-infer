@@ -4,7 +4,7 @@
 
 Generate several different-length prompts in one fixed batch, preserving the same per-request greedy token IDs as running each prompt alone. Support the existing uncached and contiguous-cache paths, retain all Milestone 1/2 correctness checks, and keep CPU mandatory with CUDA conditional on hardware. This is the next step in the user's authorized milestone sequence.
 
-Continue in the standalone `mini-infer` project on `codex/mini-infer-m1`, publishing verified milestone commits to `harshith49/mini-infer`. Keep unrelated files, model downloads, environments, and credentials out of commits. No automatic merge or force push.
+Continue in the standalone `mini-infer` project on `codex/mini-infer-m3`, publishing verified milestone commits to `harshith49/mini-infer`. Keep unrelated files, model downloads, environments, and credentials out of commits. No automatic merge or force push.
 
 ## Approach and alternatives
 

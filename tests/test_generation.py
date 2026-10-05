@@ -176,3 +176,52 @@ def test_previous_logits_released_before_next_forward(model, use_cache):
         before.remove()
         after.remove()
     assert released == [True, True, True, True]
+
+
+@pytest.mark.parametrize('use_cache', [False, True])
+@pytest.mark.parametrize('count', [0, 1])
+def test_batch_cli_preserves_prompts_and_decodes_only_suffix(monkeypatch, capsys, use_cache, count):
+    import json
+    from engine import batching
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', cache_dir='model_cache')
+    model = GPT2Model(ModelConfig(vocab_size=50257, max_positions=32, hidden_size=24,
+        num_layers=1, num_heads=4, intermediate_size=96)).eval()
+    prompts = ['', 'Hello <|endoftext|> world', 'Café — hello!\n  Spaces matter.']
+    seen = []
+    hook = model.register_forward_pre_hook(lambda module, args: seen.append(args[0].clone()))
+    monkeypatch.setattr(batching, 'load_model', lambda config: (model, tokenizer))
+    argv = ['mini-infer', '--device', 'cpu', '--max-new-tokens', str(count)]
+    for prompt in prompts:
+        argv.extend(['--prompt', prompt])
+    if use_cache:
+        argv.append('--use-cache')
+    monkeypatch.setattr(sys, 'argv', argv)
+    try:
+        batching.main()
+    finally:
+        hook.remove()
+    actual = json.loads(capsys.readouterr().out)
+    if count == 0:
+        assert actual == prompts and not seen
+    else:
+        from engine.generate import generate
+        expected = []
+        for prompt in prompts:
+            ids = tokenizer(prompt, return_tensors='pt')['input_ids'] if prompt else torch.tensor([[tokenizer.eos_token_id]])
+            result = generate(model, ids, count, use_cache=use_cache, eos_token_id=tokenizer.eos_token_id)
+            expected.append(prompt + tokenizer.decode(result[0, ids.shape[1]:].tolist(), skip_special_tokens=True))
+        assert actual == expected
+        assert seen[0][0, -1].item() == tokenizer.eos_token_id
+
+
+def test_batch_cli_negative_budget_rejected_before_loading(monkeypatch, capsys):
+    from engine import batching
+    def forbidden(*args, **kwargs):
+        raise AssertionError('invalid CLI loaded a model')
+    monkeypatch.setattr(batching, 'load_model', forbidden)
+    monkeypatch.setattr(sys, 'argv', ['mini-infer', '--prompt', 'Hello', '--max-new-tokens', '-1'])
+    with pytest.raises(SystemExit) as error:
+        batching.main()
+    assert error.value.code == 2
+    assert 'nonnegative' in capsys.readouterr().err
