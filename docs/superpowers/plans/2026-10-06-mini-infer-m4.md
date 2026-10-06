@@ -1,6 +1,6 @@
 # mini-infer Milestone 4 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for the retained native execution method. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans for the retained native execution method. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Replace completed requests between batched decode steps while preserving independent per-request outputs and publishing honest mixed-length measurements.
 
@@ -42,7 +42,7 @@
 - `sample(logits: torch.Tensor, params: SamplingParams, *, generator: torch.Generator) -> torch.Tensor`: one rank-1 nonempty floating vector, one scalar token tensor on that device; reject nonfinite raw logits. Preserve `greedy(logits)` unchanged. Temperature zero returns greedy without an RNG draw.
 - Positive temperature: center and scale scores in float64 for stability at very small temperatures, apply top-k then top-p, retain the threshold-crossing candidate, and use `torch.multinomial` with the supplied generator. No global seed resets.
 
-- [ ] Write `test_greedy_sampling_preserves_generator_state`: tied largest logits choose the lowest token ID; generator state before/after is identical. Add `test_seeded_sampling_matches_probability_oracle` against direct multinomial draws from independently calculated probabilities for an unfiltered three-token vector.
+- [x] Write `test_greedy_sampling_preserves_generator_state`: tied largest logits choose the lowest token ID; generator state before/after is identical. Add `test_seeded_sampling_matches_probability_oracle` against direct multinomial draws from independently calculated probabilities for an unfiltered three-token vector.
 
   ```python
   generator = torch.Generator().manual_seed(7)
@@ -52,12 +52,12 @@
   assert torch.equal(generator.get_state(), before)
   ```
 
-- [ ] Write filtering tests using probabilities `[0.6,0.3,0.1]`: top-p `0.7` permits IDs `{0,1}`, retaining the threshold-crossing ID; top-k one permits only ID zero; top-p one with top-k zero permits all candidates. Check top-k followed by top-p using known normalized candidate probabilities, and compare repeated draws from equal seed states.
-- [ ] Write tiny-positive-temperature and extreme-finite-logit tests: argmax remains a valid selectable candidate and all draws succeed. Parameterize invalid temperatures, top-k/top-p/seed bounds/types, empty/rank-2/integer logits, and NaN/infinity raw logits; each raises `ValueError` before drawing randomness.
-- [ ] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_sampler.py -q`; expect missing sampling API failures before implementation.
-- [ ] Implement the interfaces with tensor operations and one dataclass; validate even in greedy mode. Verify actual CPU generator/multinomial behavior on the pinned runtime.
-- [ ] Run the sampler tests and full suite; require all existing CPU checks and new sampler assertions to pass, with CUDA skips determined only by hardware.
-- [ ] Commit with `feat: add seedable temperature top-k and top-p sampling`.
+- [x] Write filtering tests using probabilities `[0.6,0.3,0.1]`: top-p `0.7` permits IDs `{0,1}`, retaining the threshold-crossing ID; top-k one permits only ID zero; top-p one with top-k zero permits all candidates. Check top-k followed by top-p using known normalized candidate probabilities, and compare repeated draws from equal seed states.
+- [x] Write tiny-positive-temperature and extreme-finite-logit tests: argmax remains a valid selectable candidate and all draws succeed. Parameterize invalid temperatures, top-k/top-p/seed bounds/types, empty/rank-2/integer logits, and NaN/infinity raw logits; each raises `ValueError` before drawing randomness.
+- [x] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_sampler.py -q`; expect missing sampling API failures before implementation.
+- [x] Implement the interfaces with tensor operations and one dataclass; validate even in greedy mode. Verify actual CPU generator/multinomial behavior on the pinned runtime.
+- [x] Run the sampler tests and full suite; require all existing CPU checks and new sampler assertions to pass, with CUDA skips determined only by hardware.
+- [x] Commit with `feat: add seedable temperature top-k and top-p sampling`.
 
 ## Task 2: Scheduler, cache packing, and recovery
 
