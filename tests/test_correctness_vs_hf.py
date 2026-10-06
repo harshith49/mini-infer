@@ -320,3 +320,62 @@ def test_public_gpt2_cuda_scheduler_parity(public_models):
     alone = run(cuda_model, gpu_prompts[:1], settings)
     assert torch.equal(mixed[0], alone[0])
     assert model.token_embedding.weight.device.type == 'cpu'
+
+
+@pytest.mark.parametrize('index', [0, 1, 2])
+@torch.inference_mode()
+def test_public_gpt2_direct_paged_50_tokens(public_models, public_batch_cases, index):
+    from engine.kv_cache import PagePool, PagedKVCache, SimpleKVCache
+    model, _, _ = public_models
+    prompts, expected = public_batch_cases
+    prompt = prompts[index]
+    capacity = len(prompt) + 50
+    pool = PagePool(model.config, num_pages=(capacity + 15) // 16, page_size=16,
+                    device=prompt.device, dtype=model.token_embedding.weight.dtype)
+    paged = PagedKVCache(pool, capacity=capacity)
+    contiguous = SimpleKVCache(model.config, batch_size=1, capacity=capacity,
+                               device=prompt.device, dtype=model.token_embedding.weight.dtype)
+    output = prompt[None].clone()
+    try:
+        for step in range(50):
+            current = output if step == 0 else output[:, -1:]
+            actual = model(current, cache=paged)
+            want = model(current, cache=contiguous)
+            torch.testing.assert_close(actual, want, atol=1e-4, rtol=1e-4)
+            token = actual[:, -1].argmax(-1)
+            del actual, want
+            output = torch.cat((output, token[:, None]), dim=1)
+        assert torch.equal(output[0], expected[index])
+    finally:
+        paged.close()
+    assert pool.free_pages == pool.num_pages and pool.owned_pages == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA hardware unavailable')
+@torch.inference_mode()
+def test_public_gpt2_cuda_direct_paged_parity(public_models):
+    import copy
+    from engine.kv_cache import PagePool, PagedKVCache, SimpleKVCache
+    model, _, tokenizer = public_models
+    target = copy.deepcopy(model).cuda().eval()
+    prompt = tokenizer(PROMPTS[0], return_tensors='pt')['input_ids'].cuda()
+    capacity = prompt.shape[1] + 50
+    pool = PagePool(target.config, num_pages=(capacity + 15) // 16,
+                    device=prompt.device, dtype=target.token_embedding.weight.dtype)
+    paged = PagedKVCache(pool, capacity=capacity)
+    contiguous = SimpleKVCache(target.config, batch_size=1, capacity=capacity,
+                               device=prompt.device, dtype=target.token_embedding.weight.dtype)
+    output = prompt.clone()
+    try:
+        for step in range(50):
+            current = output if step == 0 else output[:, -1:]
+            actual = target(current, cache=paged)
+            expected = target(current, cache=contiguous)
+            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+            assert torch.equal(actual[:, -1].argmax(-1), expected[:, -1].argmax(-1))
+            output = torch.cat((output, actual[:, -1].argmax(-1)[:, None]), dim=1)
+            del actual, expected
+    finally:
+        paged.close()
+    assert pool.free_pages == pool.num_pages
+    assert model.token_embedding.weight.device.type == 'cpu'

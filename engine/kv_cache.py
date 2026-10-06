@@ -49,23 +49,38 @@ class SimpleKVCache:
         if not 0 <= self.length <= self.capacity or self.length + input_ids.shape[1] > self.capacity:
             raise ValueError("Request exceeds KV cache capacity")
 
+    def read_prefix(self, layer_idx: int, *, length: int | None = None
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+        end = self.length if length is None else length
+        if (type(layer_idx) is not int or not 0 <= layer_idx < self.config.num_layers
+                or type(end) is not int or not 0 <= end <= self.capacity):
+            raise ValueError('Invalid cache layer or prefix length')
+        return self.keys[layer_idx, :, :, :end], self.values[layer_idx, :, :, :end]
+
     @torch.no_grad()
-    def write(self, layer_idx: int, key: torch.Tensor,
-              value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        if not 0 <= layer_idx < self.config.num_layers:
-            raise ValueError("Invalid cache layer index")
+    def store(self, layer_idx: int, offset: int, key: torch.Tensor, value: torch.Tensor) -> None:
+        if (type(layer_idx) is not int or not 0 <= layer_idx < self.config.num_layers
+                or type(offset) is not int or offset < 0):
+            raise ValueError('Invalid cache layer or offset')
+        if key.ndim != 4 or value.ndim != 4:
+            raise ValueError('Invalid key/value chunk rank')
         expected = (self.keys.shape[1], self.config.num_heads, key.shape[-2],
                     self.config.hidden_size // self.config.num_heads)
         if (key.shape != expected or value.shape != expected or key.shape[-2] == 0
                 or key.dtype != self.keys.dtype or value.dtype != self.values.dtype
                 or key.device != self.keys.device or value.device != self.values.device):
-            raise ValueError("Invalid key/value chunk shape, dtype, or device")
-        end = self.length + key.shape[-2]
+            raise ValueError('Invalid key/value chunk shape, dtype, or device')
+        end = offset + key.shape[-2]
         if end > self.capacity:
-            raise ValueError("Request exceeds KV cache capacity")
-        self.keys[layer_idx, :, :, self.length:end].copy_(key)
-        self.values[layer_idx, :, :, self.length:end].copy_(value)
-        return self.keys[layer_idx, :, :, :end], self.values[layer_idx, :, :, :end]
+            raise ValueError('Request exceeds KV cache capacity')
+        self.keys[layer_idx, :, :, offset:end].copy_(key)
+        self.values[layer_idx, :, :, offset:end].copy_(value)
+
+    @torch.no_grad()
+    def write(self, layer_idx: int, key: torch.Tensor,
+              value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.store(layer_idx, self.length, key, value)
+        return self.read_prefix(layer_idx, length=self.length + key.shape[-2])
 
 
 class PagePool:
@@ -87,6 +102,7 @@ class PagePool:
                  config.hidden_size // config.num_heads)
         self.keys = torch.empty(shape, device=self.device, dtype=dtype)
         self.values = torch.empty_like(self.keys)
+        self.device = self.keys.device
         self._free = list(range(num_pages))
         self._owned: set[int] = set()
 
@@ -127,3 +143,108 @@ class PagePool:
         for i in page_ids:
             self._owned.remove(i)
             heapq.heappush(self._free, i)
+
+
+class PagedKVCache:
+    """One request's reserved pages; gathered prefixes contain real slots only."""
+
+    def __init__(self, pool: PagePool, *, capacity: int) -> None:
+        if (not isinstance(pool, PagePool) or type(capacity) is not int
+                or not 0 < capacity <= pool.config.max_positions):
+            raise ValueError('Paged cache capacity must be a positive integer within context')
+        self.pool = pool
+        self.config = pool.config
+        self.capacity = capacity
+        self.length = 0
+        self.requires_attention_mask = False
+        self._closed = False
+        self._page_ids = pool.allocate((capacity + pool.page_size - 1) // pool.page_size)
+
+    @property
+    def page_ids(self) -> tuple[int, ...]:
+        return self._page_ids
+
+    @property
+    def allocated_bytes(self) -> int:
+        return len(self._page_ids) * self.pool.page_bytes
+
+    @property
+    def used_bytes(self) -> int:
+        return self.length * self.pool.page_bytes // self.pool.page_size
+
+    @property
+    def rounding_bytes(self) -> int:
+        return (self.allocated_bytes - self.capacity * self.pool.page_bytes // self.pool.page_size
+                if not self._closed else 0)
+
+    @property
+    def unused_bytes(self) -> int:
+        return ((self.capacity - self.length) * self.pool.page_bytes // self.pool.page_size
+                if not self._closed else 0)
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ValueError('Paged cache is closed')
+
+    def close(self) -> None:
+        if not self._closed:
+            self.pool.release(self._page_ids)
+            self._page_ids = ()
+            self.length = 0
+            self.requires_attention_mask = False
+            self._closed = True
+
+    def validate(self, config: ModelConfig, input_ids: torch.Tensor, *,
+                 device: torch.device, dtype: torch.dtype) -> None:
+        self._ensure_open()
+        if self.config != config or input_ids.shape[0] != 1:
+            raise ValueError('Paged cache model dimensions or request batch do not match')
+        if self.pool.device != device or input_ids.device != device or self.pool.dtype != dtype:
+            raise ValueError('Cache, model, and request must have matching device/dtype')
+        if not 0 <= self.length <= self.capacity or self.length + input_ids.shape[1] > self.capacity:
+            raise ValueError('Request exceeds KV cache capacity')
+
+    def _indices(self, offset: int, length: int) -> tuple[torch.Tensor, ...]:
+        positions = torch.arange(offset, offset + length, device=self.pool.device)
+        table = torch.tensor(self._page_ids, dtype=torch.long, device=self.pool.device)
+        pages = table[positions // self.pool.page_size][None, :]
+        heads = torch.arange(self.config.num_heads, device=self.pool.device)[:, None]
+        slots = (positions % self.pool.page_size)[None, :]
+        return pages, heads, slots
+
+    def read_prefix(self, layer_idx: int, *, length: int | None = None
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._ensure_open()
+        end = self.length if length is None else length
+        if (type(layer_idx) is not int or not 0 <= layer_idx < self.config.num_layers
+                or type(end) is not int or not 0 <= end <= self.capacity):
+            raise ValueError('Invalid cache layer or prefix length')
+        indices = (layer_idx, *self._indices(0, end))
+        # Broadcast heads and logical positions directly to [heads, tokens, dim].
+        # No whole-page gather or second contiguous copy is needed.
+        return self.pool.keys[indices].unsqueeze(0), self.pool.values[indices].unsqueeze(0)
+
+    @torch.no_grad()
+    def store(self, layer_idx: int, offset: int, key: torch.Tensor, value: torch.Tensor) -> None:
+        self._ensure_open()
+        if (type(layer_idx) is not int or not 0 <= layer_idx < self.config.num_layers
+                or type(offset) is not int or offset < 0):
+            raise ValueError('Invalid cache layer or offset')
+        if key.ndim != 4 or value.ndim != 4:
+            raise ValueError('Invalid key/value chunk rank')
+        expected = (1, self.config.num_heads, key.shape[-2], self.config.hidden_size // self.config.num_heads)
+        if (key.shape != expected or value.shape != expected or key.shape[-2] == 0
+                or key.dtype != self.pool.dtype or value.dtype != self.pool.dtype
+                or key.device != self.pool.device or value.device != self.pool.device):
+            raise ValueError('Invalid key/value chunk shape, dtype, or device')
+        if offset + key.shape[-2] > self.capacity:
+            raise ValueError('Request exceeds KV cache capacity')
+        indices = (layer_idx, *self._indices(offset, key.shape[-2]))
+        self.pool.keys[indices] = key[0]
+        self.pool.values[indices] = value[0]
+
+    @torch.no_grad()
+    def write(self, layer_idx: int, key: torch.Tensor,
+              value: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        self.store(layer_idx, self.length, key, value)
+        return self.read_prefix(layer_idx, length=self.length + key.shape[-2])

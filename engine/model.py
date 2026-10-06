@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from engine.config import ModelConfig
-from engine.kv_cache import SimpleKVCache
+from engine.kv_cache import PagedKVCache, SimpleKVCache
 
 
 class CausalAttention(nn.Module):
@@ -21,7 +21,7 @@ class CausalAttention(nn.Module):
             config.max_positions, config.max_positions, dtype=torch.bool).tril(),
             persistent=False)
 
-    def forward(self, x: torch.Tensor, *, cache: SimpleKVCache | None = None,
+    def forward(self, x: torch.Tensor, *, cache: SimpleKVCache | PagedKVCache | None = None,
                 layer_idx: int = 0, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         batch, length, width = x.shape
         # Heads carry independent dot products: [batch, heads, tokens, head_dim].
@@ -71,7 +71,7 @@ class TransformerBlock(nn.Module):
         self.mlp_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor, *, cache: SimpleKVCache | None = None,
+    def forward(self, x: torch.Tensor, *, cache: SimpleKVCache | PagedKVCache | None = None,
                 layer_idx: int = 0, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = x + self.attention(self.attention_norm(x), cache=cache, layer_idx=layer_idx,
                                attention_mask=attention_mask)
@@ -101,7 +101,7 @@ class GPT2Model(nn.Module):
             raise ValueError("input_ids contains a token outside the vocabulary")
 
     def forward(self, input_ids: torch.Tensor, *,
-                cache: SimpleKVCache | None = None,
+                cache: SimpleKVCache | PagedKVCache | None = None,
                 attention_mask: torch.Tensor | None = None,
                 position_ids: torch.Tensor | None = None) -> torch.Tensor:
         self.validate_input_ids(input_ids)
