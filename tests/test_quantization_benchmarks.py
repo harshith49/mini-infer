@@ -120,3 +120,80 @@ def test_nonfinite_quality_fails(monkeypatch):
     from benchmarks.bench_quantization import evaluate_perplexity
     model=quality_model();monkeypatch.setattr(model,'forward',lambda ids:torch.full((1,len(ids[0]),37),float('nan')))
     with pytest.raises(ValueError,match='finite'):evaluate_perplexity(model,torch.tensor([1,2,3]),context=8,stride=3)
+
+
+def test_comparison_pairs_workloads_storage_and_quality(monkeypatch):
+    from benchmarks import bench_quantization as bench
+    from engine.quantize import Int8Linear
+    from benchmarks.bench_stages import run_workload
+    monkeypatch.setattr(bench,'SAMPLE_SHA256',hashlib.sha256(b'sample').hexdigest())
+    monkeypatch.setattr(bench,'SAMPLE_BYTES',6)
+    model=quality_model(); original=id(model); seen=[]
+    def tokenizer(text,**kw):return {'input_ids':[1,2,3,4,5,6,7,8,9,10,11,12,13,14]}
+    def observed(current,ids,**kwargs):
+        assert id(current)==original
+        seen.append((isinstance(current.blocks[0].attention.qkv,Int8Linear),ids.clone()))
+        row=run_workload(current,ids,**kwargs)
+        row['tokens_per_second']=10 if not seen[-1][0] else 5
+        return row
+    monkeypatch.setattr(bench,'run_workload',observed,raising=False)
+    rows=bench.run_comparison(model,tokenizer,text='sample',prompt_lengths=[2,4],max_new_tokens=3,
+        repetitions=3,target_tokens=13,context=8,stride=3)
+    assert len(rows)==4 and [converted for converted,_ in seen]==[False,False,True,True]
+    assert all(torch.equal(seen[i][1],seen[i+2][1]) for i in [0,1])
+    by_stage={stage:[row for row in rows if row['stage']==stage] for stage in ['fp32_cached','int8_cached']}
+    for fp,q in zip(by_stage['fp32_cached'],by_stage['int8_cached']):
+        assert fp['throughput_ratio']==1 and q['throughput_ratio']==.5
+        assert fp['weight_bytes']>q['weight_bytes']
+        assert q['model_bytes']>q['weight_bytes'] and q['max_reconstruction_bytes']==9216
+        assert fp['cache_allocated_bytes']==q['cache_allocated_bytes']
+        assert fp['peak_memory_bytes'] is None and fp['peak_memory_kind']=='unmeasured'
+        assert fp['scored_tokens']==q['scored_tokens']==13
+        assert fp['token_sha256']==q['token_sha256']
+        assert q['relative_ppl_delta']==pytest.approx(q['perplexity']/fp['perplexity']-1)
+        assert q['weight_reduction_fraction']==pytest.approx(1-q['weight_bytes']/fp['weight_bytes'])
+        assert 'tied' in q['quantization_scope']
+
+
+@pytest.mark.parametrize('kwargs',[{'prompt_lengths':[]},{'prompt_lengths':[0]},{'prompt_lengths':[15]},
+    {'prompt_lengths':[2],'repetitions':2},{'prompt_lengths':[2],'max_new_tokens':0},
+    {'prompt_lengths':[2],'stride':8},{'prompt_lengths':[True]}, {'prompt_lengths':[2],'target_tokens':0}])
+def test_bad_comparison_rejects_before_conversion(monkeypatch,kwargs):
+    from benchmarks import bench_quantization as bench
+    model=quality_model()
+    monkeypatch.setattr(bench,'quantize_model',lambda *a:pytest.fail('invalid comparison converted'),raising=False)
+    settings=dict(max_new_tokens=3,repetitions=3,target_tokens=13,context=8,stride=3);settings.update(kwargs)
+    with pytest.raises(ValueError):bench.run_comparison(model,lambda *a,**kw:{'input_ids':list(range(14))},text='sample',**settings)
+    assert isinstance(model.blocks[0].attention.qkv,torch.nn.Linear)
+
+
+def test_comparison_rejects_already_quantized_model():
+    from benchmarks import bench_quantization as bench
+    from engine.quantize import quantize_model
+    with pytest.raises(ValueError):bench.run_comparison(quantize_model(quality_model()),None,text='sample',prompt_lengths=[2])
+
+
+def test_cli_csv_scopes_and_quality_failure_does_not_publish(monkeypatch,tmp_path):
+    import sys,csv,json
+    from benchmarks import bench_quantization as bench
+    def tokenizer(text,**kw):return {'input_ids':list(range(14))}
+    monkeypatch.setattr(bench,'load_model',lambda *a:(quality_model(),tokenizer),raising=False)
+    monkeypatch.setattr(bench,'load_quality_text',lambda *a:'sample')
+    monkeypatch.setattr(bench,'SAMPLE_SHA256',hashlib.sha256(b'sample').hexdigest())
+    monkeypatch.setattr(bench,'SAMPLE_BYTES',6)
+    path=tmp_path/'result.csv'
+    argv=['benchmark','--device','cpu','--prompt-lengths','2','--max-new-tokens','3','--quality-tokens','13','--context','8','--stride','3','--output',str(path)]
+    monkeypatch.setattr(sys,'argv',argv);bench.main()
+    with path.open() as handle:rows=list(csv.DictReader(handle))
+    assert len(rows)==2 and rows[0]['peak_memory_bytes']=='' and rows[0]['source_sha256']==bench.SAMPLE_SHA256
+    assert json.loads(rows[0]['model_config'])['vocab_size']==37
+    assert b'\r\n' not in path.read_bytes()
+    # A quality failure must not overwrite an existing valid report.
+    before=path.read_bytes();original=bench.evaluate_perplexity
+    def fail(model,*a,**kw):
+        result=original(model,*a,**kw)
+        if not isinstance(model.blocks[0].attention.qkv,torch.nn.Linear):result['perplexity']*=100
+        return result
+    monkeypatch.setattr(bench,'evaluate_perplexity',fail)
+    with pytest.raises((ValueError,SystemExit)):bench.main()
+    assert path.read_bytes()==before
