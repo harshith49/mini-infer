@@ -4,7 +4,7 @@ LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that
 
 A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and measured CPU KV-cache benchmarks.
 
-**Current status: Milestone 3, static batching.** The custom GPT-2 transformer supports independent and fixed-batch generation, with optional contiguous KV caching. Different-length batch rows match independent Hugging Face greedy tokens on CPU. Naive-versus-cached single-request CPU measurements are published below; batch throughput remains unmeasured and serving comes later.
+**Current status: Milestone 4, continuous batching.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache and mixed-request batching measurements are published below; paging and serving come later.
 
 ## Quick start
 
@@ -74,7 +74,33 @@ outputs = generate_batch(model, prompts, 50, pad_token_id=tokenizer.eos_token_id
 
 The API accepts nonempty rank-1 token tensors on the model device and a common output budget. Set `eos_token_id` to stop each row at its first generated EOS (included in the result). Finished rows keep their batch slots while other rows continue; their later filler is masked and excluded from results. Padding and genuine tokens may share an ID because the mask determines validity.
 
-Prompts are left-padded, and learned positions count real tokens. Cache capacity is `longest_prompt_length + max_new_tokens` for every row, including padding; this full physical budget must fit the 1,024-token context. GPT-2 FP32 reservation is `batch_size × capacity × 73,728` bytes. Batch speedup and process peak memory have not been measured.
+Prompts are left-padded, and learned positions count real tokens. Cache capacity is `longest_prompt_length + max_new_tokens` for every row, including padding; this full physical budget must fit the 1,024-token context. GPT-2 FP32 reservation is `batch_size × capacity × 73,728` bytes. The mixed-request cohort comparison below measures batch throughput; CPU process peak memory remains unmeasured.
+
+## Continuous batching
+
+```bash
+python -m engine.scheduler --prompt "Hello" --prompt "The quick brown fox" --max-new-tokens 5 50 --max-batch-size 2 --device cpu
+python -m engine.scheduler --prompt "Once upon a time" --max-new-tokens 30 --temperature 0.8 --top-k 20 --top-p 0.9 --seed 7
+```
+
+One budget broadcasts to all prompts; otherwise supply one per prompt. JSON results preserve submission order and original prompt text. Temperature zero is greedy. Positive temperature supports top-k then nucleus filtering. Each request owns its random generator; arrival order and other requests' seeds do not consume its random stream. Stochastic equality is checked on the same device, with no CPU/CUDA equality promise.
+
+```python
+from engine.scheduler import Scheduler
+from engine.sampler import SamplingParams
+
+scheduler = Scheduler(model, max_batch_size=2, pad_token_id=tokenizer.eos_token_id)
+scheduler.submit("short", prompts[0], 5, stop_token_ids=(tokenizer.eos_token_id,))
+scheduler.submit("long", prompts[1], 50, sampling=SamplingParams(seed=7))
+while not scheduler.idle:
+    for event in scheduler.step():
+        print(event.request_id, event.token_id, event.finish_reason)
+outputs = [scheduler.result(name) for name in ["short", "long"]]
+```
+
+The API returns unpadded prompt-plus-output IDs. Requests can arrive between steps. FIFO admission fills free slots; newly admitted requests prefill together, then previously running requests decode together. Completion frees slots for the next step. Events follow admission-then-decode order. Zero budgets complete without forwarding; multiple stop IDs are supported and the selected stop token stays in the result. Finite budgets and successful forwards ensure eventual FIFO admission.
+
+Private caches reserve each request's prompt-plus-budget capacity and contain only real tokens. Decoding temporarily packs left-padded prefixes and copies back one new K/V column. Those copies and simultaneous private/temporary storage cost time and memory. `cache_allocated_bytes` reports current private storage; `peak_kv_bytes` includes simultaneous workspaces. Completed results remain until the scheduler is discarded. The API has one synchronous owner. A forward failure leaves that phase retryable; events from an earlier successful phase are delivered once on the next successful step.
 
 ## Architecture
 
@@ -107,6 +133,8 @@ Batch checks compare each row against independent engine and HF output for 50 to
 
 On the verified CPU run, maximum absolute logit error was **0** for all three prompts. Cached token/chunk logits satisfy the same tolerance, and cached 50-token outputs match both the baseline and HF on all three prompts. The suite also tests offset causal masking, tied weights, checkpoint validation, cache capacity/byte accounting, failed-forward retry, context bounds, EOS termination, empty CLI prompts, and device selection. Public-weight tests are mandatory and fail if weights cannot be loaded. Only CUDA-specific tests skip when hardware is unavailable. CUDA numerical parity remains unverified here.
 
+Scheduler acceptance adds 50-token public greedy comparisons with active limits one/two and staggered admission. Strict public suffix-logit checks cover each request’s first eight decodes, including the long prompt, at unchanged tolerances. Longer incremental FP32 histories can differ near zero from full-prefix reductions even inside HF on Apple M5; this numerical limitation is recorded in the lessons log. Tiny-model packing checks cover every decode, and original full-forward/cached checks remain unchanged.
+
 Run the same suite after every later milestone. Preserve this uncached baseline to check optimizations independently. Quantization will use separate quality criteria because it can change greedy tokens.
 
 ## Roadmap and measurement status
@@ -115,12 +143,12 @@ Run the same suite after every later milestone. Preserve this uncached baseline 
 |---|---|---|---|
 | Naive GPT-2 | 14.56 tokens/s | Not measured | Implemented and checked on CPU |
 | KV cache | 108.49 tokens/s | Not measured | Implemented and checked on CPU |
-| Static batching | Not measured | Not measured | Implemented and checked on CPU |
-| Continuous batching | Not measured | Not measured | Planned |
+| Static FIFO cohorts | 37.36 useful tokens/s* | Not measured | Implemented and checked on CPU |
+| Continuous batching | 69.52 useful tokens/s* | Not measured | Implemented and checked on CPU |
 | Paged KV | Not measured | Not measured | Planned |
 | int8 weights | Not measured | Not measured | Planned |
 
-Representative stage values above use **128 prompt tokens + 32 generated tokens**, GPT-2 FP32 on **Apple M5 CPU**, one PyTorch thread, one warmup, and three measured repetitions. Throughput includes prefill and cache allocation. These are instrumented synthetic token-ID workloads, not production traffic or GPU figures.
+*Batch rows use the mixed workload below and are not comparable to the single-request values. Naive/KV representative values use **128 prompt tokens + 32 generated tokens**, GPT-2 FP32 on **Apple M5 CPU**, one PyTorch thread, one warmup, and three measured repetitions. Throughput includes prefill and cache allocation. These are instrumented synthetic token-ID workloads, not production traffic or GPU figures.
 
 | Prompt tokens | CPU naive tokens/s | CPU cached tokens/s | Throughput ratio | Reserved cache MiB |
 |---|---|---|---|---|
@@ -147,14 +175,34 @@ Optional flags: `--prompt-lengths 16 64 128 256`, `--max-new-tokens 32`, `--repe
 - **int8 weight-only quantization:** store linear weights with fewer bytes. Dequantization adds work and approximation can affect quality.
 - **Streaming serving:** expose concurrent requests through a scheduler and SSE endpoint. Requires cancellation and lifecycle handling.
 
-Only the naive-versus-KV benchmark is implemented. Charts, HF/vLLM comparisons, the streaming server, Docker, CI, and a Colab notebook are not implemented yet. Later results will include hardware, workload, latency, and memory context; GPU cells will stay unmeasured until actual GPU runs.
+Naive-versus-KV and fixed-cohort-versus-continuous benchmarks are implemented. Charts, HF/vLLM comparisons, the streaming server, Docker, CI, and a Colab notebook are not implemented yet. Later results will include hardware, workload, latency, and memory context; GPU cells will stay unmeasured until actual GPU runs.
+
+## Mixed-request batching measurements
+
+Apple M5 CPU, GPT-2 FP32, one PyTorch thread, active limit two, one warmup and three measured repetitions. Prompt lengths are `[16,64,32,128,16,64,32,128]`; requested output lengths are `[4,32,8,64,4,32,8,64]`. Both stages return the same **216 useful new tokens**, verified against independent cached generation.
+
+| Stage | Useful tokens/s | Median seconds | Completion p50 / p95 ms | Extra static tokens | Peak K/V MiB |
+|---|---|---|---|---|---|
+| Static FIFO cohorts | 37.36 | 5.781 | 3343.83 / 5789.01 | 168 | 27.00 |
+| Continuous batching | 69.52 | 3.107 | 1709.90 / 3106.13 | 0 | 45.98 |
+
+Continuous batching measured **1.86× useful throughput** on this workload. The fixed-cohort comparator runs each pair to its largest budget, then trims outputs; continuous requests leave at their own budgets. This comparison does not claim a speedup on every workload. Temporary packed caches increase peak K/V storage even as fewer unnecessary tokens are computed. CPU process peak and GPU performance remain unmeasured.
+
+Completion latency begins at common workload submission and ends at cohort return or completion-event delivery; these are whole-request percentiles, separate from the M2 per-token decode figures. Timers include validation, allocation, packing, prefill, sampling, and decoding, excluding loading/tokenization. The CSV records actual K/V tensors separately from process memory.
+
+```bash
+python -m benchmarks.bench_scheduler --device cpu
+python -m benchmarks.bench_scheduler --device cuda --output results/continuous_batching_cuda.csv
+```
+
+Flags include `--prompt-lengths`, `--output-budgets`, `--max-batch-size`, `--repetitions`, and `--threads`. See [results/continuous_batching.csv](results/continuous_batching.csv). Earlier [KV-cache measurements](results/kv_cache.csv) are unchanged.
 
 ## Honest limitations
 
-This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports one unpadded request or a fixed batch of different-length prompts with a shared output budget. The default baseline recomputes the full prefix; `--use-cache` enables fixed-capacity contiguous request storage. Caching still reads previous keys and values, reserves the full requested budget, and has no paging or scheduler. No custom kernels, distributed execution, stochastic sampling, quantization, or server exist yet. No comparison against vLLM has been measured.
+This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports single requests, static batches with a shared budget, and continuous requests with individual budgets/stops/sampling. The default baseline recomputes the full prefix; cached paths reserve contiguous storage. Attention still reads the full prefix, and continuous batching copies temporary packed caches every step. No paging, custom kernels, distributed execution, quantization, cancellation, asynchronous worker, or server exist yet. No comparison against vLLM has been measured.
 
 ## What I learned / what broke
 
-[The lessons log](docs/lessons.md) records actual implementation problems, fixes, and verification results. The [Milestone 1 design](docs/superpowers/specs/2026-10-05-mini-infer-m1-design.md) and [implementation plan](docs/superpowers/plans/2026-10-05-mini-infer-m1.md) explain the baseline scope. The [Milestone 2 design](docs/superpowers/specs/2026-10-05-mini-infer-m2-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m2.md) cover cached generation and measurements. The [Milestone 3 design](docs/superpowers/specs/2026-10-05-mini-infer-m3-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m3.md) cover static batching.
+[The lessons log](docs/lessons.md) records actual implementation problems, fixes, and verification results. The [Milestone 1 design](docs/superpowers/specs/2026-10-05-mini-infer-m1-design.md) and [implementation plan](docs/superpowers/plans/2026-10-05-mini-infer-m1.md) explain the baseline scope. The [Milestone 2 design](docs/superpowers/specs/2026-10-05-mini-infer-m2-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m2.md) cover cached generation and measurements. The [Milestone 3 design](docs/superpowers/specs/2026-10-05-mini-infer-m3-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m3.md) cover static batching. The [Milestone 4 design](docs/superpowers/specs/2026-10-06-mini-infer-m4-design.md) and [plan](docs/superpowers/plans/2026-10-06-mini-infer-m4.md) cover scheduling and its measurements.
 
 Code license: [MIT](LICENSE). Downloaded weights remain subject to their upstream license and are not included in this repository.

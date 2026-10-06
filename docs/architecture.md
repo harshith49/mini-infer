@@ -71,7 +71,7 @@ Without a padding mask, absolute position IDs start at `cache.length`. A chunk o
 
 Every layer writes tentatively at the same committed offset; the model advances the length only after the final logits succeed. A failed late layer leaves the earlier committed prefix intact. Retrying overwrites tentative slots. Dimensions, batch, dtype/device, and capacity are validated before the first write. This cache stores inference state and does not support differentiable training through cached keys/values.
 
-Caching saves repeated projections and MLP computation for old tokens, but attention still reads all previous keys and values. Contiguous allocation reserves the full request budget, including padding in static batches. Admission, removal of completed rows, and fragmentation remain later scheduling and paging work.
+Caching saves repeated projections and MLP computation for old tokens, but attention still reads all previous keys and values. Contiguous allocation reserves the full request budget, including padding in static batches. M4 schedules admission and completion; paging will address reservation and fragmentation.
 
 ## Fixed-batch generation
 
@@ -96,7 +96,7 @@ The masked model API requires a same-device Boolean or integer 0/1 mask covering
 
 After masked keys commit, `cache.requires_attention_mask` prevents later calls from exposing them by omitting the mask. This flag commits with length after successful logits, and a failed forward leaves committed metadata/prefix reusable. The caller must preserve historical key validity: changing an old mask is unsupported because cached hidden states were computed under that mask. The batch loop owns the full mask history; the cache does not store another mask tensor.
 
-Allocated/used byte counts include physical padding and forwarded filler slots, even though masked slots cannot influence valid tokens. There is no row compaction, admission queue, per-request budget, or measured batch speedup in this milestone.
+Allocated/used byte counts include physical padding and forwarded filler slots, even though masked slots cannot influence valid tokens. The static API keeps fixed rows and a common budget. The separate M4 scheduler handles admission and per-request budgets.
 
 ## Measurement scope
 
@@ -105,3 +105,31 @@ Allocated/used byte counts include physical padding and forwarded filler slots, 
 The optional `step_times` collector synchronizes CUDA only when measuring. Its first duration is time to the first generated token; later durations supply decode p50/p95. A one-token output has no decode samples, so those fields stay blank. Throughput is output-token count divided by median total generation time. Instrumentation adds timer calls on CPU and per-step synchronization on CUDA; compare these as instrumented engine measurements, not production serving results.
 
 CPU process peak memory is unmeasured and left blank. Cache reserved bytes are actual tensor storage, not total process memory. CUDA peak memory, when run there, is PyTorch allocated tensor memory including resident model weights, excluding tokenizer/process RAM and driver reservations. Hardware and thread counts travel with each CSV row.
+
+## Continuous batching and sampling
+
+```mermaid
+flowchart TD
+    Submit[Validate and clone request] --> Queue[FIFO waiting queue]
+    Queue --> Free{Free active slots?}
+    Free -->|yes| Prefill[Left-pad newly admitted prompts and prefill]
+    Prefill --> First[Sample first token with request generator]
+    First --> Finish{Stop or budget reached?}
+    Finish -->|no| Private[Keep real-token private K/V]
+    Private --> Pack[Pack old running prefixes into temporary batch]
+    Pack --> Decode[Forward previous sampled token per row]
+    Decode --> Sample[Sample and scatter new K/V column]
+    Sample --> Finish
+    Finish -->|yes| Release[Release private cache and retain result]
+    Release --> Queue
+```
+
+A step snapshots the existing running set, prefills new admissions into free slots, then decodes only the old snapshot. Newly admitted rows receive one token, not two. Free slots from this step are reused next step. Zero-budget admissions use no active slot. Admission events precede decode events; completed IDs cannot be reused during one scheduler lifetime. The scheduler is synchronous, single-owner, and retains completed token results.
+
+Each private cache has batch size one and capacity `prompt length + output budget`. Admission uses a temporary cache sized to the longest prompt; only real prompt K/V is retained. A request completing on its first selected token allocates no private cache. Decode packs left-aligned physical padding before each shorter real prefix, with zero-initialized masked slots, a full validity mask, and positions counting only valid tokens. Temporary capacity is largest committed prefix plus one. After successful logits, copy only the new column back. The final selected token is never forwarded unnecessarily.
+
+The model commits only the temporary cache. A model-forward fault therefore leaves private prefixes, outputs, and generators unchanged for the failed phase. Previously successful admission remains committed, with undelivered events retained for the next successful call. This is phase recovery; callers decide whether to retry. Nonfinite weights/sampling faults or allocation failure during commit are outside this model-forward recovery contract.
+
+`SamplingParams` validates finite temperature/top-p, vocabulary-bounded top-k, and a supported seed. Temperature zero uses greedy argmax without RNG consumption. For positive temperature, scale before centering when temperature is at least one to avoid extreme-FP64 subtraction overflow; center first for smaller temperatures to protect the winning score. Keep exact top-k candidates, and apply cumulative nucleus filtering including the threshold-crossing candidate. `torch.multinomial` uses the request's device generator; global randomness is untouched. Tiny positive temperatures are handled without invalidating the largest finite score.
+
+`benchmarks/bench_scheduler.py` compares fixed FIFO cohorts using their maximum budget with continuous requests using individual budgets. Static outputs are trimmed to useful requested tokens; excess static work is reported separately. Both stages are checked against independent cached generation before measurement. Total time includes submission, allocation, prefill, sampling, packing and decoding. Completion p50/p95 runs from common workload submission to cohort return or completion-event delivery; this differs from M2 per-token decode latency. CUDA timed boundaries and event delivery synchronize. Peak K/V counts include simultaneous private and temporary tensors; CPU process peak stays unmeasured.
