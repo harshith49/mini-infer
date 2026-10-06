@@ -120,7 +120,7 @@
 - CLI defaults: prompt lengths `[16,64,32,128,16,64,32,128]`, budgets `[4,32,8,64,4,32,8,64]`, active limit two, repetitions three, threads one, device auto, seed zero, output `results/continuous_batching.csv`. Reject mismatched lists, invalid counts/threads, empty workload, and over-context individual or padded static-cohort budgets before timing.
 - CSV: `stage` (`static_cohorts`/`continuous`), `device`, `hardware`, `torch_version`, `threads`, `request_count`, `max_batch_size`, `prompt_lengths`, `output_budgets`, `repetitions`, `useful_generated_tokens`, `extra_static_tokens`, `median_seconds`, `tokens_per_second`, `completion_p50_ms`, `completion_p95_ms`, `peak_kv_bytes`, `peak_memory_bytes`, `peak_memory_kind`, `workload`. Serialize lists as JSON; use LF endings. Reuse existing `hardware_name`.
 
-- [ ] Write tiny real-model metric tests for prompt lengths one/three/one and budgets one/three/one, active limit two: useful tokens five, static extra tokens two, continuous extra tokens zero, equal useful outputs, valid completion p50/p95, CPU process peak `None`/`unmeasured`, and correctly scoped K/V bytes. Static first-cohort completions share one cohort-return timestamp. CSV roundtrip preserves blank process-memory cells and JSON workload lists.
+- [x] Write tiny real-model metric tests for prompt lengths one/three/one and budgets one/three/one, active limit two: useful tokens five, static extra tokens two, continuous extra tokens zero, equal useful outputs, valid completion p50/p95, CPU process peak `None`/`unmeasured`, and correctly scoped K/V bytes. Static first-cohort completions share one cohort-return timestamp. CSV roundtrip preserves blank process-memory cells and JSON workload lists.
 
   ```python
   prompts = [torch.tensor([1]), torch.tensor([2, 3, 4]), torch.tensor([5])]
@@ -131,13 +131,14 @@
   assert row['peak_kv_bytes'] == 4608
   ```
 
-- [ ] Add invalid-workload/repetition/context tests and one-request/one-token workload checks; no test requires an elapsed-time speedup. Verify static excess tokens are excluded from the throughput numerator and latency columns describe whole-request completion, not M2 decode steps.
-- [ ] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_scheduler_benchmarks.py -q`; expect missing benchmark implementation.
-- [ ] Implement timing/CSV using standard-library tools. Observe actual static cache allocations through real-forward cache arguments; use scheduler counters for continuous private-plus-temporary K/V. Count useful/excess tokens explicitly; use median end-to-end time and inclusive completion-latency quantiles. Mark actual CUDA allocated tensor peak scope if run there; leave CPU process peak blank.
-- [ ] Run `HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.bench_scheduler --device cpu`; inspect both CSV rows and retain measured results whichever stage wins. If restricted hardware lookup only reports architecture, obtain read-only CPU metadata and rerun the exact workload with that access, as in M2.
-- [ ] Update README/status/results and queue/prefill/decode/completion Mermaid. Explain FIFO fairness, per-request seeds/stops/budgets, fixed-cohort comparator, completion-latency scope, temporary-copy memory/cost, result retention, synchronous ownership, and observed benchmark results. Record actual bugs and unresolved hardware limits in lessons; preserve project identity and earlier results.
+- [x] Add invalid-workload/repetition/context tests and one-request/one-token workload checks; no test requires an elapsed-time speedup. Verify static excess tokens are excluded from the throughput numerator and latency columns describe whole-request completion, not M2 decode steps.
+- [x] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_scheduler_benchmarks.py -q`; expect missing benchmark implementation.
+- [x] Implement timing/CSV using standard-library tools. Observe actual static cache allocations through real-forward cache arguments; use scheduler counters for continuous private-plus-temporary K/V. Count useful/excess tokens explicitly; use median end-to-end time and inclusive completion-latency quantiles. Mark actual CUDA allocated tensor peak scope if run there; leave CPU process peak blank.
+- [x] Run `HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.bench_scheduler --device cpu`; inspect both CSV rows and retain measured results whichever stage wins. If restricted hardware lookup only reports architecture, obtain read-only CPU metadata and rerun the exact workload with that access, as in M2.
+- [x] Update README/status/results and queue/prefill/decode/completion Mermaid. Explain FIFO fairness, per-request seeds/stops/budgets, fixed-cohort comparator, completion-latency scope, temporary-copy memory/cost, result retention, synchronous ownership, and observed benchmark results. Record actual bugs and unresolved hardware limits in lessons; preserve project identity and earlier results.
 - [ ] Run full suite, CPU demo, `.venv/bin/python -m compileall -q engine benchmarks`, tracked and staged whitespace checks, and verify M2 CSV is unchanged. Request one fresh independent read-only review of M4 against the approved spec and this plan; fix important findings with reproducing checks and a green full suite.
 - [ ] Commit with `bench: compare static cohorts and continuous batching on CPU`, push to `origin/codex/mini-infer-m4`, and confirm local/remote HEAD match. Create/attach a draft M4 PR against `codex/mini-infer-m3` while M3 is unmerged (otherwise the verified main dependency), using a body that matches the final implementation. Keep branches and checkout; remove only M4 scratch tracking after completion.
+
 
 ## Plan self-review
 
