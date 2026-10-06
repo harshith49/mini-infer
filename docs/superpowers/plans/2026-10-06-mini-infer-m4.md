@@ -137,7 +137,7 @@
 - [x] Run `HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 .venv/bin/python -m benchmarks.bench_scheduler --device cpu`; inspect both CSV rows and retain measured results whichever stage wins. If restricted hardware lookup only reports architecture, obtain read-only CPU metadata and rerun the exact workload with that access, as in M2.
 - [x] Update README/status/results and queue/prefill/decode/completion Mermaid. Explain FIFO fairness, per-request seeds/stops/budgets, fixed-cohort comparator, completion-latency scope, temporary-copy memory/cost, result retention, synchronous ownership, and observed benchmark results. Record actual bugs and unresolved hardware limits in lessons; preserve project identity and earlier results.
 - [x] Run full suite, CPU demo, `.venv/bin/python -m compileall -q engine benchmarks`, tracked and staged whitespace checks, and verify M2 CSV is unchanged. Request one fresh independent read-only review of M4 against the approved spec and this plan; fix important findings with reproducing checks and a green full suite.
-- [ ] Commit with `bench: compare static cohorts and continuous batching on CPU`, push to `origin/codex/mini-infer-m4`, and confirm local/remote HEAD match. Create/attach a draft M4 PR against `codex/mini-infer-m3` while M3 is unmerged (otherwise the verified main dependency), using a body that matches the final implementation. Keep branches and checkout; remove only M4 scratch tracking after completion.
+- [x] Commit with `bench: compare static cohorts and continuous batching on CPU`, push to `origin/codex/mini-infer-m4`, and confirm local/remote HEAD match. Create/attach a draft M4 PR against `codex/mini-infer-m3` while M3 is unmerged (otherwise the verified main dependency), using a body that matches the final implementation. Keep branches and checkout; remove only M4 scratch tracking after completion.
 
 
 ## Plan self-review
@@ -147,3 +147,7 @@ Task 1 owns sampling validation/filtering and RNG behavior. Task 2 owns FIFO lif
 ## Task 3 numerical-oracle ruling
 
 The added public suffix check covers the first eight decode suffixes of each request, including the long prompt and staggered admission, against independent HF cached suffixes at unchanged `atol=1e-4, rtol=1e-4`. Longer FP32 histories on Apple M5 exposed shape-dependent reductions: an independent HF incremental cache itself differed from HF full-prefix logits (273 elements outside this tolerance at the diagnostic prefix), while full engine/HF forwards matched exactly and greedy IDs remained exact. Padding operands or double attention failed to solve the reference mismatch and were rejected; production model arithmetic stays unchanged. Original M1–M3 tests, tiny-model every-step packed/private-cache checks, and all 50-token public results against full-forward engine/HF generation remain mandatory. Cost: no every-step public cached/full-prefix elementwise gate over the entire 50-token history.
+
+## Published result
+
+M4 is published on `codex/mini-infer-m4` in `harshith49/mini-infer`, draft PR [#2](https://github.com/harshith49/mini-infer/pull/2) targeting the unmerged M3 branch. Final suite: 297 passed, three CUDA hardware skips. Independent review and its reproduced sampling fix are recorded in the lessons log. No findings remain deferred.
