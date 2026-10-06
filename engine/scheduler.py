@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from engine.config import EngineConfig, ModelConfig
-from engine.kv_cache import SimpleKVCache
+from engine.kv_cache import PagePool, PagedKVCache, SimpleKVCache
 from engine.model import GPT2Model
 from engine.sampler import SamplingParams, sample
 from engine.weights import load_model
@@ -29,7 +29,7 @@ class _Request:
     stop_token_ids: frozenset[int]
     sampling: SamplingParams
     generator: torch.Generator
-    cache: SimpleKVCache | None = None
+    cache: SimpleKVCache | PagedKVCache | None = None
     finish_reason: str | None = None
 
 
@@ -40,11 +40,18 @@ class Scheduler:
     survive a later forward failure and are delivered on the next successful step.
     """
 
-    def __init__(self, model: GPT2Model, *, max_batch_size: int, pad_token_id: int) -> None:
+    def __init__(self, model: GPT2Model, *, max_batch_size: int, pad_token_id: int,
+                 page_pool: PagePool | None = None) -> None:
         if type(max_batch_size) is not int or max_batch_size <= 0:
             raise ValueError('max_batch_size must be a positive integer')
         if type(pad_token_id) is not int or not 0 <= pad_token_id < model.config.vocab_size:
             raise ValueError('pad_token_id must be an integer inside the vocabulary')
+        weight = model.token_embedding.weight
+        if page_pool is not None and (not isinstance(page_pool, PagePool)
+                or page_pool.config != model.config or page_pool.device != weight.device
+                or page_pool.dtype != weight.dtype or page_pool.free_pages != page_pool.num_pages):
+            raise ValueError('Scheduler requires a matching entirely free page pool')
+        self.page_pool = page_pool
         self.model = model
         self.max_batch_size = max_batch_size
         self.pad_token_id = pad_token_id
@@ -53,14 +60,20 @@ class Scheduler:
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._pending_events: list[TokenEvent] = []
-        self.peak_kv_bytes = 0
+        self.peak_kv_bytes = self.pool_resident_bytes
 
     @property
     def idle(self) -> bool:
         return not (self._waiting or self._running or self._pending_events)
 
     @property
+    def pool_resident_bytes(self) -> int:
+        return self.page_pool.allocated_bytes if self.page_pool is not None else 0
+
+    @property
     def cache_allocated_bytes(self) -> int:
+        if self.page_pool is not None:
+            return self.page_pool.owned_pages * self.page_pool.page_bytes
         return sum(r.cache.allocated_bytes for r in self._requests.values() if r.cache is not None)
 
     def submit(self, request_id: str, prompt: torch.Tensor, max_new_tokens: int,
@@ -75,6 +88,9 @@ class Scheduler:
             raise ValueError('max_new_tokens must be a nonnegative integer')
         if len(prompt) + max_new_tokens > self.model.config.max_positions:
             raise ValueError('Prompt plus output budget exceeds model context')
+        if (self.page_pool is not None and max_new_tokens
+                and self._required_pages(len(prompt) + max_new_tokens) > self.page_pool.num_pages):
+            raise ValueError('Request full budget exceeds the entire KV page pool')
         if (not isinstance(stop_token_ids, (tuple, list, set, frozenset))
                 or any(type(token) is not int or not 0 <= token < self.model.config.vocab_size for token in stop_token_ids)):
             raise ValueError('stop_token_ids must contain integer vocabulary IDs')
@@ -99,8 +115,12 @@ class Scheduler:
         return SimpleKVCache(self.model.config, batch_size=batch_size, capacity=capacity,
                              device=weight.device, dtype=weight.dtype)
 
-    def _record_peak(self, workspace: SimpleKVCache) -> None:
-        self.peak_kv_bytes = max(self.peak_kv_bytes, self.cache_allocated_bytes + workspace.allocated_bytes)
+    def _required_pages(self, capacity: int) -> int:
+        return (capacity + self.page_pool.page_size - 1) // self.page_pool.page_size
+
+    def _record_peak(self, workspace: SimpleKVCache, *, gather_bytes: int = 0) -> None:
+        resident = self.pool_resident_bytes if self.page_pool is not None else self.cache_allocated_bytes
+        self.peak_kv_bytes = max(self.peak_kv_bytes, resident + workspace.allocated_bytes + gather_bytes)
 
     def _append(self, request: _Request, token: torch.Tensor) -> None:
         token_id = token.item()
@@ -110,6 +130,8 @@ class Scheduler:
         elif len(request.output) - len(request.prompt) == request.max_new_tokens:
             request.finish_reason = 'length'
         if request.finish_reason is not None:
+            if isinstance(request.cache, PagedKVCache):
+                request.cache.close()
             request.cache = None
             if request.request_id in self._running:
                 self._running.remove(request.request_id)
@@ -118,6 +140,21 @@ class Scheduler:
         self._pending_events.append(TokenEvent(request.request_id, token_id, request.finish_reason))
 
     def _prefill(self, requests: list[_Request]) -> None:
+        staged: dict[str, PagedKVCache] = {}
+        try:
+            if self.page_pool is not None:
+                for request in requests:
+                    if request.max_new_tokens:
+                        staged[request.request_id] = PagedKVCache(self.page_pool,
+                            capacity=len(request.prompt) + request.max_new_tokens)
+            self._prefill_reserved(requests, staged)
+        finally:
+            # Attached continuing caches leave this dict. Failed admissions and
+            # first-token completions return every remaining reservation.
+            for cache in staged.values():
+                cache.close()
+
+    def _prefill_reserved(self, requests: list[_Request], staged: dict[str, PagedKVCache]) -> None:
         positive = [r for r in requests if r.max_new_tokens]
         workspace = None
         tokens = {}
@@ -143,14 +180,19 @@ class Scheduler:
                 continue
             token = tokens[request.request_id]
             if request.max_new_tokens > 1 and token.item() not in request.stop_token_ids:
-                cache = self._cache(1, len(request.prompt) + request.max_new_tokens)
+                cache = (staged[request.request_id] if self.page_pool is not None
+                         else self._cache(1, len(request.prompt) + request.max_new_tokens))
                 row = rows[request.request_id]
                 length = len(request.prompt)
-                cache.keys[:, :, :, :length].copy_(workspace.keys[:, row:row+1, :, width-length:width])
-                cache.values[:, :, :, :length].copy_(workspace.values[:, row:row+1, :, width-length:width])
+                for layer in range(self.model.config.num_layers):
+                    cache.store(layer, 0, workspace.keys[layer, row:row+1, :, width-length:width],
+                                workspace.values[layer, row:row+1, :, width-length:width])
                 cache.length = length
                 request.cache = cache
+                staged.pop(request.request_id, None)
                 self._record_peak(workspace)
+            elif request.request_id in staged:
+                staged.pop(request.request_id).close()
             self._append(request, token)
 
     def _decode(self, requests: list[_Request]) -> None:
@@ -166,8 +208,14 @@ class Scheduler:
         mask = torch.zeros((len(requests), past+1), dtype=torch.bool, device=device)
         for row, request in enumerate(requests):
             length = request.cache.length
-            workspace.keys[:, row:row+1, :, past-length:past].copy_(request.cache.keys[:, :, :, :length])
-            workspace.values[:, row:row+1, :, past-length:past].copy_(request.cache.values[:, :, :, :length])
+            for layer in range(self.model.config.num_layers):
+                keys, values = request.cache.read_prefix(layer)
+                gather_bytes = (sum(t.numel() * t.element_size() for t in (keys, values))
+                                if isinstance(request.cache, PagedKVCache) else 0)
+                self._record_peak(workspace, gather_bytes=gather_bytes)
+                workspace.keys[layer, row:row+1, :, past-length:past].copy_(keys)
+                workspace.values[layer, row:row+1, :, past-length:past].copy_(values)
+                del keys, values
             mask[row, past-length:] = True
         self._record_peak(workspace)
         ids = torch.stack([r.output[-1] for r in requests])[:, None]
@@ -177,8 +225,9 @@ class Scheduler:
         for row, (request, token) in enumerate(zip(requests, tokens)):
             cache = request.cache
             length = cache.length
-            cache.keys[:, :, :, length:length+1].copy_(workspace.keys[:, row:row+1, :, past:past+1])
-            cache.values[:, :, :, length:length+1].copy_(workspace.values[:, row:row+1, :, past:past+1])
+            for layer in range(self.model.config.num_layers):
+                cache.store(layer, length, workspace.keys[layer, row:row+1, :, past:past+1],
+                            workspace.values[layer, row:row+1, :, past:past+1])
             cache.length += 1
             self._append(request, token)
 
@@ -188,18 +237,24 @@ class Scheduler:
         free = self.max_batch_size - len(old)
         cohort = []
         positive = 0
+        pages_available = self.page_pool.free_pages if self.page_pool is not None else None
         for name in self._waiting:
             request = self._requests[name]
             if request.max_new_tokens:
                 if positive == free:
                     break
+                if pages_available is not None:
+                    needed = self._required_pages(len(request.prompt) + request.max_new_tokens)
+                    if needed > pages_available:
+                        break
+                    pages_available -= needed
                 positive += 1
             cohort.append(request)
         if cohort:
             self._prefill(cohort)
             for _ in cohort:
                 self._waiting.popleft()
-        # ponytail: pack/copy prefixes per step; a shared page pool comes in M5.
+        # ponytail: gather/copy prefixes per step; custom paged attention kernels remain later work.
         self._decode(old)
         events = self._pending_events
         self._pending_events = []
@@ -216,18 +271,24 @@ def main() -> None:
     parser.add_argument('--top-k', type=int, default=0)
     parser.add_argument('--top-p', type=float, default=1.)
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--cache-backend', choices=('contiguous', 'paged'), default='contiguous')
+    parser.add_argument('--num-pages', type=int, default=32)
+    parser.add_argument('--page-size', type=int, default=16)
     args = parser.parse_args()
     try:
         if len(args.max_new_tokens) not in (1, len(args.prompt)) or any(n < 0 for n in args.max_new_tokens):
             raise ValueError('Use one nonnegative output budget or one per prompt')
-        if args.max_batch_size <= 0:
-            raise ValueError('max_batch_size must be positive')
+        if args.max_batch_size <= 0 or args.num_pages <= 0 or args.page_size <= 0:
+            raise ValueError('max_batch_size, num_pages and page_size must be positive')
         settings = SamplingParams(args.temperature, args.top_k, args.top_p, args.seed)
         # This CLI loads public GPT-2; validate its default vocabulary before download.
         settings.validate(ModelConfig().vocab_size)
         model, tokenizer = load_model(EngineConfig(device=args.device))
         device = model.token_embedding.weight.device
-        scheduler = Scheduler(model, max_batch_size=args.max_batch_size, pad_token_id=tokenizer.eos_token_id)
+        pool = (PagePool(model.config, num_pages=args.num_pages, page_size=args.page_size,
+            device=device, dtype=model.token_embedding.weight.dtype) if args.cache_backend == 'paged' else None)
+        scheduler = Scheduler(model, max_batch_size=args.max_batch_size,
+                              pad_token_id=tokenizer.eos_token_id, page_pool=pool)
         prompts = []
         for i, text in enumerate(args.prompt):
             prompt = (tokenizer(text, return_tensors='pt')['input_ids'][0] if text
