@@ -4,7 +4,7 @@ LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that
 
 A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and measured CPU KV-cache benchmarks.
 
-**Current status: Milestone 4, continuous batching.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache and mixed-request batching measurements are published below; paging and serving come later.
+**Current status: Milestone 5, paged KV cache.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation measurements are published below; serving comes later.
 
 ## Quick start
 
@@ -102,6 +102,18 @@ The API returns unpadded prompt-plus-output IDs. Requests can arrive between ste
 
 Private caches reserve each request's prompt-plus-budget capacity and contain only real tokens. Decoding temporarily packs left-padded prefixes and copies back one new K/V column. Those copies and simultaneous private/temporary storage cost time and memory. `cache_allocated_bytes` reports current private storage; `peak_kv_bytes` includes simultaneous workspaces. Completed results remain until the scheduler is discarded. The API has one synchronous owner. A forward failure leaves that phase retryable; events from an earlier successful phase are delivered once on the next successful step.
 
+## Paged KV cache
+
+```bash
+python -m engine.scheduler --cache-backend paged --num-pages 32 --page-size 16 --prompt "Hello" --prompt "The quick brown fox" --max-new-tokens 5 50 --device cpu
+```
+
+Programmatically, construct `PagePool(model.config, num_pages=32, page_size=16, device=model.token_embedding.weight.device, dtype=model.token_embedding.weight.dtype)` from `engine.kv_cache` and pass it as `page_pool=pool` to `Scheduler`. One scheduler exclusively owns an initially free, matching pool. Direct `PagedKVCache(pool, capacity=...)` callers must explicitly `close()` their caches; closing is idempotent. Completion returns scheduler-owned pages, while pool tensors remain resident.
+
+Positive requests reserve their entire prompt-plus-output budget, rounded up to whole pages, before prefill. Waiting requests own no pages; an individually impossible request rejects at submission. A page-blocked FIFO head prevents smaller waiters bypassing it, so some free space can sit idle while existing requests finish. Zero-output requests require no pages. Logical exhaustion queues requests; host tensor allocation errors still propagate. Failed staged allocation/prefill returns reserved pages, and existing phase-event recovery remains intact.
+
+The PyTorch reference gathers only real prefix tokens per layer, copies them into the existing contiguous batch workspace, and scatters the new K/V column back. It provides allocation reuse, not a custom paged-attention kernel. `cache_allocated_bytes` counts owned page reservations, `pool_resident_bytes` counts the fixed pool, and `peak_kv_bytes` counts pool plus simultaneous workspace and one live gather pair without adding owned pages twice. Rounded tails and unused logical budgets are distinct costs. See the [page-table diagram](docs/architecture.md#paged-request-cache).
+
 ## Architecture
 
 ```mermaid
@@ -135,6 +147,8 @@ On the verified CPU run, maximum absolute logit error was **0** for all three pr
 
 Scheduler acceptance adds 50-token public greedy comparisons with active limits one/two and staggered admission. Strict public suffix-logit checks cover each request’s first eight decodes, including the long prompt, at unchanged tolerances. Longer incremental FP32 histories can differ near zero from full-prefix reductions even inside HF on Apple M5; this numerical limitation is recorded in the lessons log. Tiny-model packing checks cover every decode, and original full-forward/cached checks remain unchanged.
 
+Paged acceptance additionally checks all 50 direct cached suffix logits against contiguous cached execution at the same tolerance, nonconsecutive page reuse, poisoned tails, pressure-driven admission, seeded scheduling parity, and failed-forward page cleanup. The M4 additional public suffix gate stays unchanged.
+
 Run the same suite after every later milestone. Preserve this uncached baseline to check optimizations independently. Quantization will use separate quality criteria because it can change greedy tokens.
 
 ## Roadmap and measurement status
@@ -145,7 +159,7 @@ Run the same suite after every later milestone. Preserve this uncached baseline 
 | KV cache | 108.49 tokens/s | Not measured | Implemented and checked on CPU |
 | Static FIFO cohorts | 37.36 useful tokens/s* | Not measured | Implemented and checked on CPU |
 | Continuous batching | 69.52 useful tokens/s* | Not measured | Implemented and checked on CPU |
-| Paged KV | Not measured | Not measured | Planned |
+| Paged KV | Capacity/fragmentation below; throughput unmeasured | Not measured | Implemented and checked on CPU |
 | int8 weights | Not measured | Not measured | Planned |
 
 *Batch rows use the mixed workload below and are not comparable to the single-request values. Naive/KV representative values use **128 prompt tokens + 32 generated tokens**, GPT-2 FP32 on **Apple M5 CPU**, one PyTorch thread, one warmup, and three measured repetitions. Throughput includes prefill and cache allocation. These are instrumented synthetic token-ID workloads, not production traffic or GPU figures.
@@ -171,7 +185,7 @@ Optional flags: `--prompt-lengths 16 64 128 256`, `--max-new-tokens 32`, `--repe
 - **KV cache:** reuse past keys and values instead of recomputing them. Costs memory that grows with sequence length and request count.
 - **Static batching:** process several requests together to improve device utilization. Padding wastes work when lengths differ.
 - **Continuous batching:** replace completed requests between decoding steps. Costs scheduling and per-request state management.
-- **Paged KV:** allocate cache in fixed-size blocks to reduce reservation waste. Costs page-table bookkeeping and, in a PyTorch reference, gathers.
+- **Paged KV:** reuse fixed-size blocks across requests, including nonconsecutive free pages. Full budgets remain reserved; rounding wastes space and PyTorch gathers add copies.
 - **int8 weight-only quantization:** store linear weights with fewer bytes. Dequantization adds work and approximation can affect quality.
 - **Streaming serving:** expose concurrent requests through a scheduler and SSE endpoint. Requires cancellation and lifecycle handling.
 
@@ -197,12 +211,32 @@ python -m benchmarks.bench_scheduler --device cuda --output results/continuous_b
 
 Flags include `--prompt-lengths`, `--output-budgets`, `--max-batch-size`, `--repetitions`, and `--threads`. See [results/continuous_batching.csv](results/continuous_batching.csv). Earlier [KV-cache measurements](results/kv_cache.csv) are unchanged.
 
+## Fixed-budget page measurements
+
+The allocation-only CPU experiment uses GPT-2 FP32, page size 16, and a requested 32 MiB budget. Both stages use the same **31.5 MiB effective budget** (28 pages); the remaining 0.5 MiB cannot form another page. Real inference output equality is checked separately before allocation experiments. Throughput, latency and process peak memory are unmeasured here.
+
+| Experiment | Contiguous | Paged |
+|---|---|---|
+| Clean capacity, repeated 17-token reservations | 26 requests; 31.08 MiB resident | 14 requests; 31.50 MiB resident |
+| Rounded page tails in clean capacity | 0 MiB | 14.77 MiB |
+| Fragmented trace: 224 free slots, largest hole 16, probe needs 32 | Probe rejected; 14 requests remain | Probe accepted using pages 0 and 2; 15 requests remain |
+
+The clean trace deliberately crosses a page boundary: each 17-token request occupies 32 paged slots. Paging loses capacity here. The fragmented contiguous comparator is a **metadata first-fit arena**, not a measured PyTorch allocator; its resident-memory cell is blank. The paged comparator uses actual pool allocations. This demonstrates reuse of nonconsecutive free blocks, without claiming CUDA allocator behavior or a general capacity/speed improvement. All reservations have zero committed K/V in these allocation traces.
+
+```bash
+python -m benchmarks.bench_paged --device cpu
+```
+
+Flags include `--budget-mib`, `--page-size`, `--capacities`, `--threads`, and `--output`. [results/paged_cache.csv](results/paged_cache.csv) includes model configuration, budgets, allocation kinds, replayable traces and byte scopes. Earlier M2/M4 CSVs are unchanged.
+
 ## Honest limitations
 
-This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports single requests, static batches with a shared budget, and continuous requests with individual budgets/stops/sampling. The default baseline recomputes the full prefix; cached paths reserve contiguous storage. Attention still reads the full prefix, and continuous batching copies temporary packed caches every step. No paging, custom kernels, distributed execution, quantization, cancellation, asynchronous worker, or server exist yet. No comparison against vLLM has been measured.
+This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports single requests, static batches with a shared budget, and continuous requests with individual budgets/stops/sampling. The default baseline recomputes the full prefix; cached paths reserve contiguous storage by default, with optional paged private caches in the scheduler. Attention still reads the full prefix, and continuous batching copies temporary packed caches every step. No custom kernels, distributed execution, quantization, cancellation, asynchronous worker, or server exist yet. No comparison against vLLM has been measured.
 
 ## What I learned / what broke
 
 [The lessons log](docs/lessons.md) records actual implementation problems, fixes, and verification results. The [Milestone 1 design](docs/superpowers/specs/2026-10-05-mini-infer-m1-design.md) and [implementation plan](docs/superpowers/plans/2026-10-05-mini-infer-m1.md) explain the baseline scope. The [Milestone 2 design](docs/superpowers/specs/2026-10-05-mini-infer-m2-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m2.md) cover cached generation and measurements. The [Milestone 3 design](docs/superpowers/specs/2026-10-05-mini-infer-m3-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m3.md) cover static batching. The [Milestone 4 design](docs/superpowers/specs/2026-10-06-mini-infer-m4-design.md) and [plan](docs/superpowers/plans/2026-10-06-mini-infer-m4.md) cover scheduling and its measurements.
+
+The [Milestone 5 design](docs/superpowers/specs/2026-10-06-mini-infer-m5-design.md) and [plan](docs/superpowers/plans/2026-10-06-mini-infer-m5.md) cover page ownership, recovery and allocation measurements.
 
 Code license: [MIT](LICENSE). Downloaded weights remain subject to their upstream license and are not included in this repository.
