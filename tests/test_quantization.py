@@ -148,3 +148,131 @@ def test_int8_device_movement_cuda():
     model=quantize_model(tiny_model()).to('cuda')
     with torch.inference_mode(): assert torch.isfinite(model(torch.tensor([[1,2]],device='cuda'))).all()
     assert all(layer.qweight.dtype==torch.int8 and layer.scale.dtype==torch.float32 for layer in projections(model))
+
+
+@pytest.mark.parametrize('value',[1,'yes',None])
+def test_int8_config_rejects_non_boolean(value):
+    from engine.config import EngineConfig
+    with pytest.raises(ValueError): EngineConfig(int8=value)
+
+
+@pytest.mark.parametrize('enabled',[False,True])
+def test_loader_maps_before_quantizing(monkeypatch,enabled):
+    from transformers import GPT2Config,GPT2LMHeadModel
+    from engine import weights
+    from engine.config import EngineConfig
+    from engine.quantize import Int8Linear
+    hf=GPT2Config(vocab_size=37,n_positions=64,n_embd=24,n_layer=2,n_head=4,n_inner=96)
+    reference=GPT2LMHeadModel(hf).eval()
+    expected=reference.transformer.h[0].attn.c_attn.weight.detach().T.clone()
+    monkeypatch.setattr(weights.GPT2Config,'from_pretrained',lambda *a,**kw:hf)
+    monkeypatch.setattr(weights.GPT2LMHeadModel,'from_pretrained',lambda *a,**kw:(reference,{'missing_keys':[],'mismatched_keys':[],'error_msgs':[]}))
+    monkeypatch.setattr(weights.AutoTokenizer,'from_pretrained',lambda *a,**kw:object())
+    model,_=weights.load_model(EngineConfig(device='cpu',int8=enabled))
+    layer=model.blocks[0].attention.qkv
+    assert isinstance(layer,Int8Linear)==enabled
+    if enabled:
+        error=(layer.qweight.float()*layer.scale-expected).abs()
+        assert (error<=layer.scale/2+1e-7).all()
+    else: torch.testing.assert_close(layer.weight,expected,atol=0,rtol=0)
+    assert model.lm_head.weight is model.token_embedding.weight and not model.training
+
+
+@pytest.mark.parametrize('module_name',['generate','batching','scheduler'])
+@pytest.mark.parametrize('enabled',[False,True])
+def test_cli_int8_ordered_outputs(monkeypatch,capsys,module_name,enabled):
+    import importlib,json,sys
+    from engine.quantize import quantize_model
+    from engine.generate import generate
+    module=importlib.import_module('engine.'+module_name)
+    model=tiny_model(); seen=[]
+    class Tokenizer:
+        eos_token_id=0
+        def __call__(self,text,**kw):return {'input_ids':torch.tensor([[ord(c)%36+1 for c in text]])}
+        def decode(self,ids,**kw):return ' '.join(str(i) for i in ids if i!=0)
+    tok=Tokenizer()
+    def load(config):
+        seen.append(config.int8)
+        return (quantize_model(model) if config.int8 else model),tok
+    monkeypatch.setattr(module,'load_model',load)
+    argv=[module_name,'--prompt','Hi','--max-new-tokens','3','--device','cpu']
+    if enabled:argv+=['--int8']
+    if module_name!='scheduler':argv+=['--use-cache']
+    if module_name!='generate':argv+=['--prompt','Café']
+    if module_name=='scheduler':argv+=['--cache-backend','paged','--num-pages','2','--page-size','4']
+    monkeypatch.setattr(sys,'argv',argv);module.main()
+    texts=['Hi'] if module_name=='generate' else ['Hi','Café']
+    expected=[]
+    for text in texts:
+        ids=tok(text)['input_ids'];output=generate(model,ids,3,use_cache=True,eos_token_id=0)
+        expected.append(text+tok.decode(output[0,len(ids[0]):].tolist()))
+    actual=capsys.readouterr().out.strip()
+    assert (actual if module_name=='generate' else json.loads(actual))==(expected[0] if module_name=='generate' else expected)
+    assert seen==[enabled]
+
+
+def test_quantized_cache_chunk_batch_and_page_retry(monkeypatch):
+    from engine.quantize import quantize_model
+    from engine.generate import generate
+    from engine.batching import generate_batch
+    from engine.kv_cache import SimpleKVCache,PagePool,PagedKVCache
+    from engine.scheduler import Scheduler
+    model=quantize_model(tiny_model());ids=torch.tensor([[1,2,3,4,5,6,7]])
+    pool=PagePool(model.config,num_pages=5,page_size=4,device=torch.device('cpu'),dtype=torch.float32)
+    for cache in [SimpleKVCache(model.config,batch_size=1,capacity=16,device=torch.device('cpu'),dtype=torch.float32),PagedKVCache(pool,capacity=16)]:
+        if isinstance(cache,PagedKVCache):pool.keys.fill_(float('nan'));pool.values.fill_(float('nan'))
+        with torch.inference_mode():
+            model(ids[:,:3],cache=cache)
+            suffix=model(ids[:,3:],cache=cache)
+            torch.testing.assert_close(suffix,model(ids)[:,3:],atol=1e-4,rtol=1e-4)
+        if isinstance(cache,PagedKVCache):cache.close()
+    prompts=[torch.tensor([1,2,3]),torch.tensor([4,5,6,7,8])]
+    expected=[generate(model,p[None],6,use_cache=True)[0] for p in prompts]
+    assert all(torch.equal(a,b) for a,b in zip(expected,generate_batch(model,prompts,6,pad_token_id=0,use_cache=True)))
+    assert all(torch.equal(a,generate(model,p[None],6)[0]) for a,p in zip(expected,prompts))
+    scheduler=Scheduler(model,max_batch_size=2,pad_token_id=0,page_pool=pool)
+    for i,p in enumerate(prompts):scheduler.submit(str(i),p,6)
+    scheduler.submit('zero',torch.tensor([1]),0)
+    scheduler.step();before=scheduler.result('0').clone() if scheduler.idle else scheduler._requests['0'].output.clone()
+    original=model.lm_head.forward
+    def fail(x):raise RuntimeError('injected late projection')
+    monkeypatch.setattr(model.lm_head,'forward',fail)
+    with pytest.raises(RuntimeError,match='injected'):scheduler.step()
+    assert torch.equal(scheduler._requests['0'].output,before)
+    monkeypatch.setattr(model.lm_head,'forward',original)
+    while not scheduler.idle:scheduler.step()
+    assert all(torch.equal(scheduler.result(str(i)),x) for i,x in enumerate(expected))
+    assert torch.equal(scheduler.result('zero'),torch.tensor([1])) and pool.free_pages==5
+
+
+def test_int8_seeded_sampling_stops_and_global_rng_under_page_pressure():
+    from engine.quantize import quantize_model
+    from engine.generate import generate
+    from engine.kv_cache import PagePool
+    from engine.scheduler import Scheduler
+    from engine.sampler import SamplingParams
+    model = quantize_model(tiny_model())
+    prompts = [torch.tensor([1, 2, 3]), torch.tensor([4, 5, 6, 7, 8])]
+    stop = generate(model, prompts[0][None], 1, use_cache=True)[0, -1].item()
+    settings = [SamplingParams(), SamplingParams(temperature=.8, top_k=7, top_p=.9, seed=13)]
+    random_state = torch.random.get_rng_state().clone()
+    expected = []
+    for i, prompt in enumerate(prompts):
+        alone = Scheduler(model, max_batch_size=1, pad_token_id=0)
+        alone.submit(str(i), prompt, 6, sampling=settings[i], stop_token_ids=(stop,) if i == 0 else ())
+        while not alone.idle:
+            alone.step()
+        expected.append(alone.result(str(i)))
+    pool = PagePool(model.config, num_pages=4, page_size=4, device=torch.device('cpu'), dtype=torch.float32)
+    mixed = Scheduler(model, max_batch_size=3, pad_token_id=0, page_pool=pool)
+    for i, prompt in enumerate(prompts):
+        mixed.submit(str(i), prompt, 6, sampling=settings[i], stop_token_ids=(stop,) if i == 0 else ())
+    mixed.submit('zero', torch.tensor([9]), 0)
+    events = []
+    while not mixed.idle:
+        events.extend(mixed.step())
+    assert len(expected[0]) == len(prompts[0]) + 1
+    assert all(torch.equal(mixed.result(str(i)), output) for i, output in enumerate(expected))
+    assert torch.equal(mixed.result('zero'), torch.tensor([9]))
+    assert [event.request_id for event in events].count('0') == 1
+    assert pool.free_pages == 4 and torch.equal(random_state, torch.random.get_rng_state())

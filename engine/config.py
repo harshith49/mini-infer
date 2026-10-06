@@ -31,3 +31,8 @@ class EngineConfig:
     device: str = "auto"
     model_name: str = "gpt2"
     cache_dir: str = "model_cache"
+    int8: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.int8) is not bool:
+            raise ValueError("int8 must be a Boolean")

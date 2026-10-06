@@ -72,11 +72,12 @@ def main() -> None:
     parser.add_argument("--use-cache", action="store_true", help="Prefill once, then decode with KV cache")
     parser.add_argument("--max-new-tokens", type=int, default=50)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--int8", action="store_true", help="Store transformer projection weights as int8")
     args = parser.parse_args()
     try:
         if args.max_new_tokens < 0:
             raise ValueError("max_new_tokens must be a nonnegative integer")
-        model, tokenizer = load_model(EngineConfig(device=args.device))
+        model, tokenizer = load_model(EngineConfig(device=args.device, int8=args.int8))
         device = model.token_embedding.weight.device
         # GPT-2 cannot forward an empty sequence; EOS is also its BOS seed.
         ids = (tokenizer(args.prompt, return_tensors="pt")["input_ids"] if args.prompt

@@ -40,7 +40,8 @@ class Int8Linear(nn.Module):
                 or (self.bias is not None and self.bias.dtype != torch.float32)):
             raise ValueError('Int8Linear needs same-device FP32 input with matching final dimension')
         # ponytail: reconstruct a layer every forward; fused integer kernels only if measurements justify them.
-        weight = self.qweight.float() * self.scale
+        weight = self.qweight.float()
+        weight.mul_(self.scale)
         return F.linear(input, weight, self.bias)
 
 

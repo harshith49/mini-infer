@@ -478,3 +478,81 @@ def test_public_gpt2_cuda_paged_scheduler_parity(public_models):
     sampled = SamplingParams(temperature=.8, top_k=20, top_p=.9, seed=7)
     assert torch.equal(run(prompts, True, sampled)[0], run(prompts[:1], True, sampled)[0])
     assert model.token_embedding.weight.device.type == 'cpu'
+
+
+@pytest.fixture(scope='session')
+def public_int8_model():
+    model,_=load_model(EngineConfig(device='cpu',int8=True))
+    return model
+
+
+@pytest.mark.parametrize('prompt',PROMPTS)
+def test_public_int8_logit_error(public_models,public_int8_model,prompt):
+    fp32,_,tokenizer=public_models
+    ids=tokenizer(prompt,return_tensors='pt')['input_ids']
+    with torch.inference_mode():
+        difference=(public_int8_model(ids)-fp32(ids)).double()
+    maximum=difference.abs().max().item();rmse=difference.square().mean().sqrt().item()
+    # A per-token vocabulary offset cancels in softmax. Keep raw errors visible.
+    centered = difference - difference.mean(dim=-1, keepdim=True)
+    centered_max = centered.abs().max().item()
+    centered_rmse = centered.square().mean().sqrt().item()
+    print(f'int8 raw max={maximum:.9g}, raw rmse={rmse:.9g}; '
+          f'centered max={centered_max:.9g}, centered rmse={centered_rmse:.9g}')
+    assert centered_max <= 2.0 and centered_rmse <= .25
+    assert isinstance(fp32.blocks[0].attention.qkv,torch.nn.Linear)
+
+
+@pytest.mark.parametrize('limit',[1,2])
+@pytest.mark.parametrize('pressure',[False,True])
+def test_public_int8_cached_and_paged_50_tokens(public_models,public_int8_model,limit,pressure):
+    from engine.generate import generate
+    from engine.scheduler import Scheduler
+    from engine.kv_cache import PagePool
+    _,_,tokenizer=public_models;model=public_int8_model
+    prompts=[tokenizer(text,return_tensors='pt')['input_ids'][0] for text in PROMPTS]
+    expected=[generate(model,p[None],50,use_cache=True)[0] for p in prompts]
+    pages=[(len(p)+50+15)//16 for p in prompts]
+    pool=PagePool(model.config,num_pages=max(pages) if pressure else sum(pages),page_size=16,
+        device=torch.device('cpu'),dtype=torch.float32)
+    for backend in [None,pool]:
+        scheduler=Scheduler(model,max_batch_size=limit,pad_token_id=tokenizer.eos_token_id,page_pool=backend)
+        for i,prompt in enumerate(prompts):scheduler.submit(str(i),prompt,50)
+        while not scheduler.idle:scheduler.step()
+        assert all(torch.equal(scheduler.result(str(i)),value) for i,value in enumerate(expected))
+    assert pool.free_pages==pool.num_pages
+
+
+def test_quantized_public_sample_perplexity_delta(public_models,public_int8_model):
+    import hashlib
+    from benchmarks.bench_quantization import load_quality_text,quality_input_ids,evaluate_perplexity
+    fp32,_,tokenizer=public_models
+    ids=quality_input_ids(tokenizer,load_quality_text())
+    original=evaluate_perplexity(fp32,ids);quantized=evaluate_perplexity(public_int8_model,ids)
+    delta=quantized['perplexity']/original['perplexity']-1
+    print(f'quality ids sha256={hashlib.sha256(ids.numpy().tobytes()).hexdigest()} FP32={original} int8={quantized} relative_delta={delta:.9g}')
+    assert original['scored_tokens']==quantized['scored_tokens']==4096
+    assert delta<=.05
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA hardware unavailable')
+def test_public_int8_cuda_error_and_cache(public_models):
+    from copy import deepcopy
+    from engine.quantize import quantize_model
+    from engine.generate import generate
+    from engine.scheduler import Scheduler
+    from engine.kv_cache import PagePool
+    fp32,_,tokenizer=public_models
+    baseline=deepcopy(fp32).cuda();model=quantize_model(deepcopy(fp32)).cuda()
+    prompt=tokenizer(PROMPTS[0],return_tensors='pt')['input_ids'].cuda()
+    with torch.inference_mode():
+        error=(model(prompt)-baseline(prompt)).double()
+    print(f'CUDA int8 raw max={error.abs().max().item()}, raw rmse={error.square().mean().sqrt().item()}')
+    centered = error - error.mean(dim=-1, keepdim=True)
+    assert centered.abs().max().item() <= 2 and centered.square().mean().sqrt().item() <= .25
+    expected=generate(model,prompt,50,use_cache=True)[0]
+    pool=PagePool(model.config,num_pages=4,page_size=16,device=torch.device('cuda'),dtype=torch.float32)
+    s=Scheduler(model,max_batch_size=1,pad_token_id=tokenizer.eos_token_id,page_pool=pool)
+    s.submit('a',prompt[0],50)
+    while not s.idle:s.step()
+    assert torch.equal(s.result('a'),expected) and pool.free_pages==4
