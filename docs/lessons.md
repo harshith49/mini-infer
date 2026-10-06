@@ -127,3 +127,15 @@ The same fixed text slice measured FP32 NLL 4.264483484/PPL 71.128171649 versus 
 The actual isolated CPU benchmark records 497,759,232 FP32 weight bytes versus 243,287,040 int8-stage weight bytes, a 51.1236% reduction. Total model tensor bytes include another 12,582,912 bytes of causal masks; the largest reconstruction is 9,437,184 bytes. At 128 prompt tokens plus 32 outputs, throughput drops 89.02 to 24.06 tokens/s. Across tested lengths, int8 reaches 0.26–0.37× FP32 throughput. This reference trades speed for storage; no fused kernel or GPU speedup is claimed. The same single owned model is measured before/after conversion, and prior milestone CSVs remain unchanged.
 
 Before the approved amendment, integration verification reported 477 passed, 7 CUDA skips and 3 failing raw-logit acceptance tests (one for each public prompt). Real int8 single, static-batch and paged-scheduler CLI demonstrations succeeded. After the approved amendment, the full suite passed 480 tests with seven CUDA skips in 127 seconds. An additional int8 seeded-sampling/stops/global-RNG integration check passed separately before final review.
+
+
+### Milestone 6 final review and publication — October 7, 2026
+
+The fresh read-only reviewer independently ran **481 tests successfully, with seven CUDA hardware skips**, in 122.82 seconds. It found no Critical or Important issues, confirmed the eight CSV rows and approved comparison scope, and verified unchanged earlier CSVs and clean whitespace. M6 is published as draft [PR #4](https://github.com/harshith49/mini-infer/pull/4), stacked on unmerged M5.
+
+Two Minor findings are deferred:
+
+- A malformed programmatic projection bias length is not validated before conversion. Standard checkpoint loading checks shapes; an already-invalid custom model can be converted before its forward raises a dimension error.
+- Finite NLL as large as 1,000 overflows `math.exp`, producing an `OverflowError` traceback instead of the intended `ValueError`. The recorded GPT-2 results are unaffected.
+
+Execution rulings: retain the existing checkout/manual ledger (manual upkeep); progress independent benchmark work while awaiting the criterion decision (task-order bookkeeping); use the approved centered quantization gate (additive raw offsets are accepted, with raw errors retained). CUDA stays unverified because hardware is absent (device-specific issues may remain). Training and dtype-changing mixed precision remain outside this FP32 inference contract (they need a separate implementation). Allocation-failure recovery during conversion has no atomicity guarantee (reload a fresh FP32 model after such a failure). No blocking fix pass or second review was needed.
