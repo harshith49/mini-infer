@@ -279,3 +279,99 @@ def test_exact_context_budgets_and_one_token_no_persistent_cache(model, schedule
     event, = scheduler.step()
     assert event.finish_reason == 'length' and scheduler._requests['C'].cache is None
     assert scheduler.cache_allocated_bytes == 0
+
+
+@torch.inference_mode()
+def sampled_reference(model, prompt, count, params):
+    from engine.sampler import sample
+    generator = torch.Generator(device=prompt.device).manual_seed(params.seed)
+    output = prompt.clone()
+    for _ in range(count):
+        logits = model(output[None])[0, -1]
+        token = sample(logits, params, generator=generator)
+        del logits
+        output = torch.cat((output, token.reshape(1)))
+    return output
+
+
+@pytest.mark.parametrize('params', [SamplingParams(temperature=10., seed=7),
+    SamplingParams(temperature=5., top_k=8, top_p=0.9, seed=7)])
+@pytest.mark.parametrize('placement', ['alone', 'first', 'second', 'late'])
+def test_sampling_isolated_from_rows_arrivals_and_global_rng(model, params, placement):
+    from engine.scheduler import Scheduler
+    prompt = torch.tensor([1, 2])
+    expected = sampled_reference(model, prompt, 8, params)
+    s = Scheduler(model, max_batch_size=2, pad_token_id=0)
+    if placement in ['second', 'late']:
+        s.submit('other', torch.tensor([3, 4, 5]), 3, sampling=SamplingParams(temperature=4., seed=99))
+    if placement == 'late':
+        s.step()
+    s.submit('target', prompt, 8, sampling=params)
+    if placement == 'first':
+        s.submit('other', torch.tensor([6]), 1, sampling=SamplingParams(temperature=3., seed=32))
+    global_state = torch.random.get_rng_state().clone()
+    drain(s)
+    assert torch.equal(s.result('target'), expected)
+    assert torch.equal(torch.random.get_rng_state(), global_state)
+
+
+def test_previous_logits_and_workspaces_released_between_phases(model, scheduler):
+    import weakref
+    previous_logits, previous_cache = [], []
+    def before(module, args, kwargs):
+        assert not previous_logits or previous_logits[-1]() is None
+        assert not previous_cache or previous_cache[-1]() is None
+        previous_cache.append(weakref.ref(kwargs['cache']))
+    pre = model.register_forward_pre_hook(before, with_kwargs=True)
+    post = model.register_forward_hook(lambda module, args, logits: previous_logits.append(weakref.ref(logits)))
+    for name, ids, budget in [('A', [1], 4), ('B', [2, 3], 1), ('C', [4, 5, 6], 3)]:
+        scheduler.submit(name, torch.tensor(ids), budget)
+    try:
+        drain(scheduler)
+    finally:
+        pre.remove()
+        post.remove()
+    assert len(previous_logits) > 3 and all(ref() is None for ref in previous_cache)
+
+
+@pytest.mark.parametrize('budgets', [[0], [1], [1, 3, 2]])
+def test_scheduler_cli_order_empty_special_unicode_and_budgets(monkeypatch, capsys, budgets):
+    import json
+    import sys
+    from engine import scheduler as cli
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained('gpt2', cache_dir='model_cache')
+    model = GPT2Model(ModelConfig(vocab_size=50257, max_positions=32, hidden_size=24,
+        num_layers=1, num_heads=4, intermediate_size=96)).eval()
+    prompts = ['', 'Hello <|endoftext|> world', 'Café — hello!\n  Spaces matter.']
+    monkeypatch.setattr(cli, 'load_model', lambda config: (model, tokenizer))
+    argv = ['mini-infer', '--max-new-tokens', *map(str, budgets), '--device', 'cpu']
+    for prompt in prompts:
+        argv += ['--prompt', prompt]
+    monkeypatch.setattr(sys, 'argv', argv)
+    cli.main()
+    actual = json.loads(capsys.readouterr().out)
+    expected = []
+    for i, text in enumerate(prompts):
+        ids = tokenizer(text, return_tensors='pt')['input_ids'] if text else torch.tensor([[tokenizer.eos_token_id]])
+        count = budgets[0] if len(budgets) == 1 else budgets[i]
+        output = generate(model, ids, count, eos_token_id=tokenizer.eos_token_id, use_cache=True)[0]
+        expected.append(text + tokenizer.decode(output[ids.shape[1]:].tolist(), skip_special_tokens=True))
+    assert actual == expected
+
+
+@pytest.mark.parametrize('extra', [
+    ['--max-new-tokens', '-1'], ['--max-new-tokens', '1', '2'], ['--max-batch-size', '0'],
+    ['--temperature', '-1'], ['--temperature', 'nan'], ['--top-k', '-1'], ['--top-p', '0'], ['--seed', '-1'],
+])
+def test_scheduler_cli_invalid_arguments_before_loading(monkeypatch, capsys, extra):
+    import sys
+    from engine import scheduler as cli
+    def forbidden(*args, **kwargs):
+        raise AssertionError('invalid CLI loaded model')
+    monkeypatch.setattr(cli, 'load_model', forbidden)
+    monkeypatch.setattr(sys, 'argv', ['mini-infer', '--prompt', 'Hello', *extra])
+    with pytest.raises(SystemExit) as error:
+        cli.main()
+    assert error.value.code == 2
+    assert capsys.readouterr().err

@@ -1,12 +1,16 @@
 """Synchronous FIFO continuous batching with real-token private KV caches."""
+import argparse
 from collections import deque
+import json
 from dataclasses import dataclass
 
 import torch
 
+from engine.config import EngineConfig, ModelConfig
 from engine.kv_cache import SimpleKVCache
 from engine.model import GPT2Model
 from engine.sampler import SamplingParams, sample
+from engine.weights import load_model
 
 
 @dataclass(frozen=True)
@@ -200,3 +204,44 @@ class Scheduler:
         events = self._pending_events
         self._pending_events = []
         return events
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='mini-infer: FIFO continuous batching')
+    parser.add_argument('--prompt', action='append', required=True)
+    parser.add_argument('--max-new-tokens', nargs='+', type=int, default=[50])
+    parser.add_argument('--max-batch-size', type=int, default=2)
+    parser.add_argument('--device', choices=('auto', 'cpu', 'cuda'), default='auto')
+    parser.add_argument('--temperature', type=float, default=0.)
+    parser.add_argument('--top-k', type=int, default=0)
+    parser.add_argument('--top-p', type=float, default=1.)
+    parser.add_argument('--seed', type=int, default=0)
+    args = parser.parse_args()
+    try:
+        if len(args.max_new_tokens) not in (1, len(args.prompt)) or any(n < 0 for n in args.max_new_tokens):
+            raise ValueError('Use one nonnegative output budget or one per prompt')
+        if args.max_batch_size <= 0:
+            raise ValueError('max_batch_size must be positive')
+        settings = SamplingParams(args.temperature, args.top_k, args.top_p, args.seed)
+        # This CLI loads public GPT-2; validate its default vocabulary before download.
+        settings.validate(ModelConfig().vocab_size)
+        model, tokenizer = load_model(EngineConfig(device=args.device))
+        device = model.token_embedding.weight.device
+        scheduler = Scheduler(model, max_batch_size=args.max_batch_size, pad_token_id=tokenizer.eos_token_id)
+        prompts = []
+        for i, text in enumerate(args.prompt):
+            prompt = (tokenizer(text, return_tensors='pt')['input_ids'][0] if text
+                      else torch.tensor([tokenizer.eos_token_id], dtype=torch.long)).to(device)
+            budget = args.max_new_tokens[0] if len(args.max_new_tokens) == 1 else args.max_new_tokens[i]
+            scheduler.submit(str(i), prompt, budget, stop_token_ids=(tokenizer.eos_token_id,), sampling=settings)
+            prompts.append(prompt)
+        while not scheduler.idle:
+            scheduler.step()
+    except ValueError as error:
+        parser.error(str(error))
+    print(json.dumps([text + tokenizer.decode(scheduler.result(str(i))[len(prompt):].tolist(), skip_special_tokens=True)
+        for i, (text, prompt) in enumerate(zip(args.prompt, prompts))], ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    main()

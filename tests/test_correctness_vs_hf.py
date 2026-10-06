@@ -252,3 +252,71 @@ def test_public_gpt2_cuda_batch_parity(public_models):
     torch.testing.assert_close(model(ids, attention_mask=mask),
         cuda_model(ids.cuda(), attention_mask=mask.cuda()).cpu(), atol=1e-4, rtol=1e-4)
     assert model.token_embedding.weight.device.type == 'cpu'
+
+
+@pytest.mark.parametrize('limit', [1, 2])
+@torch.inference_mode()
+def test_public_gpt2_continuous_greedy_50_tokens(public_models, public_batch_cases, limit, monkeypatch):
+    from engine.scheduler import Scheduler
+    model, reference, tokenizer = public_models
+    prompts, expected = public_batch_cases
+    scheduler = Scheduler(model, max_batch_size=limit, pad_token_id=tokenizer.eos_token_id)
+    for i in [0, 1]:
+        scheduler.submit(str(i), prompts[i], 50)
+    # Check representative cached suffixes for every prompt/admission regime.
+    # Over long incremental histories, HF itself differs from its full-prefix
+    # reduction near zero logits; exact 50-token outputs remain mandatory.
+    original_decode = scheduler._decode
+    def checked_decode(requests):
+        if not requests:
+            return original_decode(requests)
+        snapshots = [(r.output.clone(), len(r.output) - len(r.prompt)) for r in requests]
+        def check(module, args, logits):
+            for row, (ids, generated) in enumerate(snapshots):
+                if generated > 8:
+                    continue
+                prefix = reference(ids[None, :-1], use_cache=True)
+                want = reference(ids[None, -1:], past_key_values=prefix.past_key_values,
+                                 use_cache=True).logits[0]
+                torch.testing.assert_close(logits[row], want, atol=1e-4, rtol=1e-4)
+        hook = model.register_forward_hook(check)
+        try:
+            return original_decode(requests)
+        finally:
+            hook.remove()
+    monkeypatch.setattr(scheduler, '_decode', checked_decode)
+    for _ in range(3):
+        scheduler.step()
+    scheduler.submit('2', prompts[2], 50)
+    while not scheduler.idle:
+        scheduler.step()
+    for i in range(3):
+        assert torch.equal(scheduler.result(str(i)), expected[i])
+    assert scheduler.cache_allocated_bytes == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA hardware unavailable')
+@torch.inference_mode()
+def test_public_gpt2_cuda_scheduler_parity(public_models):
+    import copy
+    from engine.scheduler import Scheduler
+    from engine.sampler import SamplingParams
+    model, _, tokenizer = public_models
+    cuda_model = copy.deepcopy(model).cuda().eval()
+    prompts = [tokenizer(text, return_tensors='pt')['input_ids'][0] for text in PROMPTS[:2]]
+    def run(target, prompts, settings):
+        scheduler = Scheduler(target, max_batch_size=2, pad_token_id=tokenizer.eos_token_id)
+        for i, prompt in enumerate(prompts):
+            scheduler.submit(str(i), prompt, 50, sampling=settings)
+        while not scheduler.idle:
+            scheduler.step()
+        return [scheduler.result(str(i)) for i in range(len(prompts))]
+    cpu = run(model, prompts, SamplingParams())
+    gpu_prompts = [prompt.cuda() for prompt in prompts]
+    gpu = run(cuda_model, gpu_prompts, SamplingParams())
+    assert all(torch.equal(a, b.cpu()) for a, b in zip(cpu, gpu))
+    settings = SamplingParams(temperature=0.8, top_k=20, top_p=0.9, seed=7)
+    mixed = run(cuda_model, gpu_prompts, settings)
+    alone = run(cuda_model, gpu_prompts[:1], settings)
+    assert torch.equal(mixed[0], alone[0])
+    assert model.token_embedding.weight.device.type == 'cpu'
