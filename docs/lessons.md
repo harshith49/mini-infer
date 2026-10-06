@@ -108,3 +108,7 @@ One finding was initially graded minor because normal FP32 GPT-2 logits cannot t
 - CUDA checks remain conditional and unverified on this CPU-only host. No custom attention kernel or extra dependency was added.
 
 M5 pre-review verification: 406 tests passed, five CUDA hardware checks skipped. Real paged CLI output matches contiguous generation for budgets 5/50. Benchmark tests cover byte arithmetic, trace replay, schema scope, early validation and cleanup faults.
+
+### Milestone 5 final review
+
+The fresh read-only reviewer found no critical, important or minor findings and independently reran 406 tests (five CUDA skips). All four allocation rows reproduced except sandbox hardware detection (`arm` versus the original escalated `Apple M5` detection). Whitespace passed, and M2/M4 CSVs were unchanged. No fix pass or deferred findings were needed. Execution retained the project-local manual ledger; its cost is manual upkeep. M5 is published as draft [PR #3](https://github.com/harshith49/mini-infer/pull/3), stacked on unmerged M4.
