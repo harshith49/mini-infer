@@ -45,11 +45,11 @@
 
 **Interfaces produced:** `PagePool(config: ModelConfig, *, num_pages: int, page_size: int = 16, device: torch.device, dtype: torch.dtype)`; `allocate(count: int) -> tuple[int, ...]`; `release(page_ids: tuple[int, ...]) -> None`; read-only properties `free_pages`, `owned_pages`, `free_page_ids`, `allocated_bytes`, `page_bytes`. `keys` and `values` have `[layers, pages, heads, page_size, head_dim]`. Free IDs are returned in ascending order; allocation raises `MemoryError` atomically if insufficient.
 
-- [ ] Write `test_pool_nonconsecutive_reuse_and_atomic_exhaustion` using config vocab 37/context 64/hidden 24/layers 2/heads 4/intermediate 96, FP32 CPU, four pages of four tokens. Assert first reservations `(0,1)` and `(2,3)`; release `(0,2)`; next two-page allocation returns `(0,2)`; exhausted allocation preserves all state. Actual page bytes are 1,536 and pool bytes 6,144.
-- [ ] Write validation tests rejecting Boolean/noninteger/nonpositive page counts, size and allocation count, nonfloating dtype, duplicate/unknown/out-of-range/noninteger returned IDs before mutation. Valid release restores `free_pages + owned_pages == num_pages`; default page size is 16. Verify `allocated_bytes` from both tensor storages and constant residency after all returns.
-- [ ] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_paged_cache.py -q`; expect missing `PagePool` failures.
-- [ ] Implement validated construction and deterministic free-ID allocation using standard-library `heapq` plus allocated-ID membership. Validate the whole release list before changing membership/free IDs. Public ID sequences are immutable tuples; manual ownership corruption is unsupported.
-- [ ] Run the targeted tests and full suite; require all original tests and new pool checks green. Commit `feat: add atomic shared KV page allocation`.
+- [x] Write `test_pool_nonconsecutive_reuse_and_atomic_exhaustion` using config vocab 37/context 64/hidden 24/layers 2/heads 4/intermediate 96, FP32 CPU, four pages of four tokens. Assert first reservations `(0,1)` and `(2,3)`; release `(0,2)`; next two-page allocation returns `(0,2)`; exhausted allocation preserves all state. Actual page bytes are 1,536 and pool bytes 6,144.
+- [x] Write validation tests rejecting Boolean/noninteger/nonpositive page counts, size and allocation count, nonfloating dtype, duplicate/unknown/out-of-range/noninteger returned IDs before mutation. Valid release restores `free_pages + owned_pages == num_pages`; default page size is 16. Verify `allocated_bytes` from both tensor storages and constant residency after all returns.
+- [x] Run `HF_HUB_OFFLINE=1 .venv/bin/python -m pytest tests/test_paged_cache.py -q`; expect missing `PagePool` failures.
+- [x] Implement validated construction and deterministic free-ID allocation using standard-library `heapq` plus allocated-ID membership. Validate the whole release list before changing membership/free IDs. Public ID sequences are immutable tuples; manual ownership corruption is unsupported.
+- [x] Run the targeted tests and full suite; require all original tests and new pool checks green. Commit `feat: add atomic shared KV page allocation`.
 
 ## Task 2: Logical paged cache and direct-model parity
 
