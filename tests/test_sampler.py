@@ -75,3 +75,17 @@ def test_invalid_logits_rejected_before_rng_draw(logits):
     with pytest.raises(ValueError):
         sampler.sample(logits, sampler.SamplingParams(temperature=1.), generator=generator)
     assert torch.equal(before, generator.get_state())
+
+
+def test_extreme_finite_logits_with_large_temperature(monkeypatch):
+    # Both candidates must remain possible: normalized logits are [1, -1].
+    observed = []
+    multinomial = torch.multinomial
+    def inspect(probabilities, count, *, generator):
+        observed.append(probabilities.clone())
+        return multinomial(probabilities, count, generator=generator)
+    monkeypatch.setattr(torch, 'multinomial', inspect)
+    from engine.sampler import SamplingParams, sample
+    sample(torch.tensor([1e308, -1e308], dtype=torch.float64),
+           SamplingParams(temperature=1e308), generator=torch.Generator().manual_seed(7))
+    torch.testing.assert_close(observed[0], torch.tensor([1., -1.], dtype=torch.float64).softmax(-1))

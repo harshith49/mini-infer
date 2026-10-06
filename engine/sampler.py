@@ -39,10 +39,15 @@ def sample(logits: torch.Tensor, params: SamplingParams,
     params.validate(logits.numel())
     if params.temperature == 0:
         return greedy(logits)
-    # Center before dividing: tiny positive temperatures may map losers to -inf,
-    # but the largest finite score stays zero and leaves a valid distribution.
     scores = logits.double()
-    scores = (scores - scores.max()) / params.temperature
+    if params.temperature >= 1:
+        # Scale first so opposite extreme finite FP64 logits cannot overflow
+        # their difference before a large temperature brings them into range.
+        scores = scores / params.temperature
+        scores = scores - scores.max()
+    else:
+        # Center first so a tiny temperature cannot overflow the winning score.
+        scores = (scores - scores.max()) / params.temperature
     if params.top_k:
         values, indices = scores.topk(params.top_k)
         scores = torch.full_like(scores, float('-inf')).scatter(0, indices, values)
