@@ -71,7 +71,7 @@ Without a padding mask, absolute position IDs start at `cache.length`. A chunk o
 
 Every layer writes tentatively at the same committed offset; the model advances the length only after the final logits succeed. A failed late layer leaves the earlier committed prefix intact. Retrying overwrites tentative slots. Dimensions, batch, dtype/device, and capacity are validated before the first write. This cache stores inference state and does not support differentiable training through cached keys/values.
 
-Caching saves repeated projections and MLP computation for old tokens, but attention still reads all previous keys and values. Contiguous allocation reserves the full request budget, including padding in static batches. M4 schedules admission and completion; paging will address reservation and fragmentation.
+Caching saves repeated projections and MLP computation for old tokens, but attention still reads all previous keys and values. Contiguous allocation reserves the full request budget, including padding in static batches. M4 schedules admission and completion; M5 allows nonconsecutive block reuse while still reserving full output budgets.
 
 ## Fixed-batch generation
 
@@ -126,10 +126,30 @@ flowchart TD
 
 A step snapshots the existing running set, prefills new admissions into free slots, then decodes only the old snapshot. Newly admitted rows receive one token, not two. Free slots from this step are reused next step. Zero-budget admissions use no active slot. Admission events precede decode events; completed IDs cannot be reused during one scheduler lifetime. The scheduler is synchronous, single-owner, and retains completed token results.
 
-Each private cache has batch size one and capacity `prompt length + output budget`. Admission uses a temporary cache sized to the longest prompt; only real prompt K/V is retained. A request completing on its first selected token allocates no private cache. Decode packs left-aligned physical padding before each shorter real prefix, with zero-initialized masked slots, a full validity mask, and positions counting only valid tokens. Temporary capacity is largest committed prefix plus one. After successful logits, copy only the new column back. The final selected token is never forwarded unnecessarily.
+Each private cache has batch size one and capacity `prompt length + output budget`. Admission uses a temporary cache sized to the longest prompt; only real prompt K/V is retained. In contiguous mode, a request completing on its first selected token allocates no private cache. Paged mode reserves before prefill and immediately returns those pages on completion. Decode packs left-aligned physical padding before each shorter real prefix, with zero-initialized masked slots, a full validity mask, and positions counting only valid tokens. Temporary capacity is largest committed prefix plus one. After successful logits, copy only the new column back. The final selected token is never forwarded unnecessarily.
 
 The model commits only the temporary cache. A model-forward fault therefore leaves private prefixes, outputs, and generators unchanged for the failed phase. Previously successful admission remains committed, with undelivered events retained for the next successful call. This is phase recovery; callers decide whether to retry. Nonfinite weights/sampling faults or allocation failure during commit are outside this model-forward recovery contract.
 
 `SamplingParams` validates finite temperature/top-p, vocabulary-bounded top-k, and a supported seed. Temperature zero uses greedy argmax without RNG consumption. For positive temperature, scale before centering when temperature is at least one to avoid extreme-FP64 subtraction overflow; center first for smaller temperatures to protect the winning score. Keep exact top-k candidates, and apply cumulative nucleus filtering including the threshold-crossing candidate. `torch.multinomial` uses the request's device generator; global randomness is untouched. Tiny positive temperatures are handled without invalidating the largest finite score.
 
 `benchmarks/bench_scheduler.py` compares fixed FIFO cohorts using their maximum budget with continuous requests using individual budgets. Static outputs are trimmed to useful requested tokens; excess static work is reported separately. Both stages are checked against independent cached generation before measurement. Total time includes submission, allocation, prefill, sampling, packing and decoding. Completion p50/p95 runs from common workload submission to cohort return or completion-event delivery; this differs from M2 per-token decode latency. CUDA timed boundaries and event delivery synchronize. Peak K/V counts include simultaneous private and temporary tensors; CPU process peak stays unmeasured.
+
+## Paged request cache
+
+```mermaid
+flowchart LR
+    L0[Logical block 0: tokens 0..15] --> P0[Physical page 0]
+    L1[Logical block 1: tokens 16..31] --> P2[Physical page 2]
+    L2[Logical block 2: tokens 32..47] --> P4[Physical page 4]
+    P0 --> Pool[Shared K/V pool: layers × pages × heads × page size × head dim]
+    P2 --> Pool
+    P4 --> Pool
+```
+
+`PagePool` allocates deterministic free IDs atomically, validates entire release lists before mutation, and keeps fixed K/V tensors resident. `PagedKVCache` reserves `ceil(capacity / page_size)` pages and maps logical positions through its immutable page-ID tuple. Per-layer advanced indexing gathers only the requested real prefix. Stores scatter chunks across page boundaries; tentative writes and model-level metadata commits follow the contiguous recovery contract. Returned pages need no clearing because consumers read only written real tokens. Explicit `close()` releases IDs; no finalizer provides automatic release.
+
+A scheduler attaches one matching, entirely free pool for exclusive use. Submission rejects positive capacities exceeding the whole pool; waiting requests reserve nothing. Each admission cohort reserves full budgets before its prefill forward. Allocation or forward failure closes all staged tables; successfully attached running tables survive later decode failure. Completion returns pages before clearing request ownership. FIFO page pressure cannot let a smaller waiter bypass a blocked head. Finite budgets and successful forwards eventually release capacity.
+
+The temporary masked batch cache stays contiguous. Each private paged layer is gathered, copied into the zero-initialized workspace, then released before the next gather or model forward. Only the new K/V column is scattered after successful logits. Peak K/V counts include the fixed resident pool, live workspace and one gather pair; owned page reservations are a subset of the pool, not extra storage. Rounded slots beyond capacity and unused slots within the logical budget are counted separately. This reference keeps full-budget reservation and gather overhead; it does not implement paged attention kernels, eviction, swapping, cancellation or multiple owners.
+
+`bench_paged` uses identical whole-page effective budgets. Clean capacity allocates real caches and measures the admitted FIFO prefix of supplied capacities. Fragmentation fills page-sized reservations, frees alternate ones, then probes two pages: contiguous is a coalescing first-fit metadata arena, while paged uses actual tensors/nonconsecutive IDs. Metadata reservation is logical capacity; its resident bytes and all process peaks remain unmeasured. The separate real-model correctness gate must pass before either experiment. These traces measure allocation capacity, not serving speed.

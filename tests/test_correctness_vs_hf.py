@@ -320,3 +320,161 @@ def test_public_gpt2_cuda_scheduler_parity(public_models):
     alone = run(cuda_model, gpu_prompts[:1], settings)
     assert torch.equal(mixed[0], alone[0])
     assert model.token_embedding.weight.device.type == 'cpu'
+
+
+@pytest.mark.parametrize('index', [0, 1, 2])
+@torch.inference_mode()
+def test_public_gpt2_direct_paged_50_tokens(public_models, public_batch_cases, index):
+    from engine.kv_cache import PagePool, PagedKVCache, SimpleKVCache
+    model, _, _ = public_models
+    prompts, expected = public_batch_cases
+    prompt = prompts[index]
+    capacity = len(prompt) + 50
+    pool = PagePool(model.config, num_pages=(capacity + 15) // 16, page_size=16,
+                    device=prompt.device, dtype=model.token_embedding.weight.dtype)
+    paged = PagedKVCache(pool, capacity=capacity)
+    contiguous = SimpleKVCache(model.config, batch_size=1, capacity=capacity,
+                               device=prompt.device, dtype=model.token_embedding.weight.dtype)
+    output = prompt[None].clone()
+    try:
+        for step in range(50):
+            current = output if step == 0 else output[:, -1:]
+            actual = model(current, cache=paged)
+            want = model(current, cache=contiguous)
+            torch.testing.assert_close(actual, want, atol=1e-4, rtol=1e-4)
+            token = actual[:, -1].argmax(-1)
+            del actual, want
+            output = torch.cat((output, token[:, None]), dim=1)
+        assert torch.equal(output[0], expected[index])
+    finally:
+        paged.close()
+    assert pool.free_pages == pool.num_pages and pool.owned_pages == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA hardware unavailable')
+@torch.inference_mode()
+def test_public_gpt2_cuda_direct_paged_parity(public_models):
+    import copy
+    from engine.kv_cache import PagePool, PagedKVCache, SimpleKVCache
+    model, _, tokenizer = public_models
+    target = copy.deepcopy(model).cuda().eval()
+    prompt = tokenizer(PROMPTS[0], return_tensors='pt')['input_ids'].cuda()
+    capacity = prompt.shape[1] + 50
+    pool = PagePool(target.config, num_pages=(capacity + 15) // 16,
+                    device=prompt.device, dtype=target.token_embedding.weight.dtype)
+    paged = PagedKVCache(pool, capacity=capacity)
+    contiguous = SimpleKVCache(target.config, batch_size=1, capacity=capacity,
+                               device=prompt.device, dtype=target.token_embedding.weight.dtype)
+    output = prompt.clone()
+    try:
+        for step in range(50):
+            current = output if step == 0 else output[:, -1:]
+            actual = target(current, cache=paged)
+            expected = target(current, cache=contiguous)
+            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+            assert torch.equal(actual[:, -1].argmax(-1), expected[:, -1].argmax(-1))
+            output = torch.cat((output, actual[:, -1].argmax(-1)[:, None]), dim=1)
+            del actual, expected
+    finally:
+        paged.close()
+    assert pool.free_pages == pool.num_pages
+    assert model.token_embedding.weight.device.type == 'cpu'
+
+
+@pytest.mark.parametrize('limit', [1, 2])
+@pytest.mark.parametrize('budgets', [[50, 50, 50], [5, 50, 50]])
+@torch.inference_mode()
+def test_public_gpt2_paged_scheduler_parity_and_pressure(public_models, public_batch_cases, limit, budgets, monkeypatch):
+    from engine.kv_cache import PagePool
+    from engine.scheduler import Scheduler
+    model, reference, tokenizer = public_models
+    prompts, expected = public_batch_cases
+    pool = PagePool(model.config, num_pages=14, page_size=16,
+                    device=prompts[0].device, dtype=model.token_embedding.weight.dtype)
+    scheduler = Scheduler(model, max_batch_size=limit, pad_token_id=tokenizer.eos_token_id, page_pool=pool)
+    for i in [0, 1]:
+        scheduler.submit(str(i), prompts[i], budgets[i])
+    original = scheduler._decode
+    def checked_decode(requests):
+        snapshots = [(r.output.clone(), len(r.output) - len(r.prompt)) for r in requests]
+        def check(module, args, logits):
+            for row, (ids, generated) in enumerate(snapshots):
+                if generated > 8:
+                    continue
+                prefix = reference(ids[None, :-1], use_cache=True)
+                want = reference(ids[None, -1:], past_key_values=prefix.past_key_values, use_cache=True).logits[0]
+                torch.testing.assert_close(logits[row], want, atol=1e-4, rtol=1e-4)
+        hook = model.register_forward_hook(check)
+        try:
+            return original(requests)
+        finally:
+            hook.remove()
+    monkeypatch.setattr(scheduler, '_decode', checked_decode)
+    for _ in range(3):
+        scheduler.step()
+    scheduler.submit('2', prompts[2], budgets[2])
+    page_blocked = False
+    while not scheduler.idle:
+        if scheduler._waiting and len(scheduler._running) < limit:
+            request = scheduler._requests[scheduler._waiting[0]]
+            page_blocked |= scheduler._required_pages(len(request.prompt) + request.max_new_tokens) > pool.free_pages
+        scheduler.step()
+    for i in range(3):
+        assert torch.equal(scheduler.result(str(i)), expected[i][:len(prompts[i]) + budgets[i]])
+    if limit == 2 and budgets[0] == 5:
+        assert page_blocked
+    assert pool.free_pages == pool.num_pages and scheduler.cache_allocated_bytes == 0
+    assert scheduler.pool_resident_bytes == pool.allocated_bytes
+
+
+@torch.inference_mode()
+def test_public_gpt2_paged_sampling_same_device(public_models):
+    from engine.kv_cache import PagePool
+    from engine.scheduler import Scheduler
+    from engine.sampler import SamplingParams
+    model, _, tokenizer = public_models
+    prompts = [tokenizer(text, return_tensors='pt')['input_ids'][0] for text in PROMPTS[:2]]
+    budgets = [5, 20]
+    pages = max((len(p) + n + 15) // 16 for p, n in zip(prompts, budgets))
+    outputs = []
+    settings = SamplingParams(temperature=.8, top_k=20, top_p=.9, seed=7)
+    for paged in [False, True]:
+        pool = PagePool(model.config, num_pages=pages, device=prompts[0].device,
+                        dtype=model.token_embedding.weight.dtype) if paged else None
+        scheduler = Scheduler(model, max_batch_size=2, pad_token_id=tokenizer.eos_token_id, page_pool=pool)
+        for i, (prompt, budget) in enumerate(zip(prompts, budgets)):
+            scheduler.submit(str(i), prompt, budget, sampling=settings)
+        while not scheduler.idle:
+            scheduler.step()
+        outputs.append([scheduler.result(str(i)) for i in range(2)])
+        if pool is not None:
+            assert pool.free_pages == pool.num_pages
+    assert all(torch.equal(a, b) for a, b in zip(*outputs))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA hardware unavailable')
+@torch.inference_mode()
+def test_public_gpt2_cuda_paged_scheduler_parity(public_models):
+    import copy
+    from engine.kv_cache import PagePool
+    from engine.scheduler import Scheduler
+    from engine.sampler import SamplingParams
+    model, _, tokenizer = public_models
+    target = copy.deepcopy(model).cuda().eval()
+    prompts = [tokenizer(text, return_tensors='pt')['input_ids'][0].cuda() for text in PROMPTS[:2]]
+    def run(prompts, paged, settings):
+        pool = PagePool(target.config, num_pages=64, device=prompts[0].device,
+                        dtype=target.token_embedding.weight.dtype) if paged else None
+        scheduler = Scheduler(target, max_batch_size=2, pad_token_id=tokenizer.eos_token_id, page_pool=pool)
+        for i, prompt in enumerate(prompts):
+            scheduler.submit(str(i), prompt, 50, sampling=settings)
+        while not scheduler.idle:
+            scheduler.step()
+        if pool is not None:
+            assert pool.free_pages == pool.num_pages
+        return [scheduler.result(str(i)) for i in range(len(prompts))]
+    greedy = SamplingParams()
+    assert all(torch.equal(a, b) for a, b in zip(run(prompts, False, greedy), run(prompts, True, greedy)))
+    sampled = SamplingParams(temperature=.8, top_k=20, top_p=.9, seed=7)
+    assert torch.equal(run(prompts, True, sampled)[0], run(prompts[:1], True, sampled)[0])
+    assert model.token_embedding.weight.device.type == 'cpu'
