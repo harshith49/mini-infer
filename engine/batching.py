@@ -74,11 +74,12 @@ def main() -> None:
     parser.add_argument('--max-new-tokens', type=int, default=50)
     parser.add_argument('--device', choices=('auto', 'cpu', 'cuda'), default='auto')
     parser.add_argument('--use-cache', action='store_true')
+    parser.add_argument("--int8", action="store_true", help="Store transformer projection weights as int8")
     args = parser.parse_args()
     try:
         if args.max_new_tokens < 0:
             raise ValueError('max_new_tokens must be a nonnegative integer')
-        model, tokenizer = load_model(EngineConfig(device=args.device))
+        model, tokenizer = load_model(EngineConfig(device=args.device, int8=args.int8))
         device = model.token_embedding.weight.device
         prompts = [(tokenizer(text, return_tensors='pt')['input_ids'][0] if text
                     else torch.tensor([tokenizer.eos_token_id], dtype=torch.long)).to(device)

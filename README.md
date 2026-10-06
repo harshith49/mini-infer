@@ -4,7 +4,7 @@ LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that
 
 A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and measured CPU KV-cache benchmarks.
 
-**Current status: Milestone 5, paged KV cache.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation measurements are published below; serving comes later.
+**Current status: Milestone 6, int8 transformer weights.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; serving comes later.
 
 ## Quick start
 
@@ -114,6 +114,18 @@ Positive requests reserve their entire prompt-plus-output budget, rounded up to 
 
 The PyTorch reference gathers only real prefix tokens per layer, copies them into the existing contiguous batch workspace, and scatters the new K/V column back. It provides allocation reuse, not a custom paged-attention kernel. `cache_allocated_bytes` counts owned page reservations, `pool_resident_bytes` counts the fixed pool, and `peak_kv_bytes` counts pool plus simultaneous workspace and one live gather pair without adding owned pages twice. Rounded tails and unused logical budgets are distinct costs. See the [page-table diagram](docs/architecture.md#paged-request-cache).
 
+## Int8 transformer weights
+
+```bash
+python -m engine.generate --int8 --use-cache --device cpu --prompt "Hello, world!" --max-new-tokens 50
+python -m engine.batching --int8 --use-cache --prompt "Hello" --prompt "The quick brown fox" --max-new-tokens 20
+python -m engine.scheduler --int8 --cache-backend paged --num-pages 32 --prompt "Hello" --max-new-tokens 20
+```
+
+`EngineConfig(int8=True)` enables the same option programmatically. Each of GPT-2's 48 transformer projections stores int8 weights with one symmetric scale per output row. Every forward reconstructs the current layer into FP32 for ordinary floating matmul. Biases, normalization, embeddings and the tied vocabulary head remain FP32; KV caches also stay FP32. This inference-only reference reduces weight storage but adds reconstruction work. Move the model by device only; mixed-precision conversion/training is unsupported.
+
+Quantized acceptance compares logits after subtracting each token's vocabulary mean: an additive vocabulary offset cancels in softmax. The bounds are centered maximum error 2.0 and RMSE 0.25; observed maxima across three prompts are 0.9081 and 0.07275. Raw errors remain documented (maximum 8.1086, RMSE 2.1856). This comparison was approved after diagnosing the failed raw-logit assumptions. The separate 5% perplexity-increase gate and original FP32 correctness tests remain unchanged.
+
 ## Architecture
 
 ```mermaid
@@ -160,7 +172,7 @@ Run the same suite after every later milestone. Preserve this uncached baseline 
 | Static FIFO cohorts | 37.36 useful tokens/s* | Not measured | Implemented and checked on CPU |
 | Continuous batching | 69.52 useful tokens/s* | Not measured | Implemented and checked on CPU |
 | Paged KV | Capacity/fragmentation below; throughput unmeasured | Not measured | Implemented and checked on CPU |
-| int8 weights | Not measured | Not measured | Planned |
+| int8 transformer weights | 51.12% fewer weight bytes; 24.06 tokens/s** | Not measured | Implemented and checked on CPU |
 
 *Batch rows use the mixed workload below and are not comparable to the single-request values. Naive/KV representative values use **128 prompt tokens + 32 generated tokens**, GPT-2 FP32 on **Apple M5 CPU**, one PyTorch thread, one warmup, and three measured repetitions. Throughput includes prefill and cache allocation. These are instrumented synthetic token-ID workloads, not production traffic or GPU figures.
 
@@ -229,14 +241,37 @@ python -m benchmarks.bench_paged --device cpu
 
 Flags include `--budget-mib`, `--page-size`, `--capacities`, `--threads`, and `--output`. [results/paged_cache.csv](results/paged_cache.csv) includes model configuration, budgets, allocation kinds, replayable traces and byte scopes. Earlier M2/M4 CSVs are unchanged.
 
+## Int8 memory, speed and quality measurements
+
+An isolated Apple M5 CPU run used GPT-2, one thread, one warmup and three repetitions, 32 generated tokens, the same seed-zero prompts in both stages, and cached generation. The same exclusively owned model was measured in FP32, then converted in place. Loading, conversion and quality evaluation were outside generation timers.
+
+| Prompt tokens | FP32 cached tokens/s | Int8 cached tokens/s | Int8 / FP32 throughput |
+|---|---|---|---|
+| 16 | 110.13 | 28.78 | 0.26× |
+| 64 | 102.01 | 30.85 | 0.30× |
+| 128 | 89.02 | 24.06 | 0.27× |
+| 256 | 70.10 | 25.65 | 0.37× |
+
+**The int8 reference is slower on this CPU.** Weight storage falls from **474.70 to 232.02 MiB (51.12%)**, including scales and floating parameters and counting the tied embedding/head once. Including causal masks, resident model tensors total 486.70 versus 244.02 MiB. Maximum one-layer reconstruction is 9 MiB, an analytic temporary tensor size, not process peak. KV reservation is unchanged. CPU process/ conversion peaks and CUDA performance are unmeasured. The roadmap's int8 speed (** above) uses 128 prompt + 32 output tokens from this paired run; older milestone measurements have their own run context.
+
+Quality uses a pinned, checksum-verified runtime download of [Tiny Shakespeare](https://github.com/karpathy/char-rnn/tree/370cbcd448eb7daf32f21a6be560b70e0b33c4e3/data/tinyshakespeare). The first 4,097 GPT-2 tokens produce 4,096 scored targets, context 1,024 and stride 512; overlapping context is not rescored. FP32 perplexity is **71.1282**, int8 **70.1133** (1.43% lower on this slice). This passes the planned 5% maximum increase gate, but does not establish broad quality improvement. Greedy tokens may differ from FP32.
+
+```bash
+python -m benchmarks.bench_quantization --device cpu
+```
+
+The first run downloads public weights and text into ignored `model_cache/`. Later runs support `HF_HUB_OFFLINE=1`; missing/corrupt quality data fails clearly. Flags include `--prompt-lengths`, `--max-new-tokens`, `--repetitions`, `--threads`, `--quality-tokens`, `--context`, `--stride`, and `--output`. [results/quantization.csv](results/quantization.csv) records source/revision/checksums, scoring windows, bytes, quality and timing scopes. Earlier CSVs are unchanged.
+
 ## Honest limitations
 
-This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports single requests, static batches with a shared budget, and continuous requests with individual budgets/stops/sampling. The default baseline recomputes the full prefix; cached paths reserve contiguous storage by default, with optional paged private caches in the scheduler. Attention still reads the full prefix, and continuous batching copies temporary packed caches every step. No custom kernels, distributed execution, quantization, cancellation, asynchronous worker, or server exist yet. No comparison against vLLM has been measured.
+This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports single requests, static batches with a shared budget, and continuous requests with individual budgets/stops/sampling. The default baseline recomputes the full prefix; cached paths reserve contiguous storage by default, with optional paged private caches in the scheduler. Attention still reads the full prefix, and continuous batching copies temporary packed caches every step. No custom kernels, distributed execution, cancellation, asynchronous worker, or server exist yet. No comparison against vLLM has been measured.
 
 ## What I learned / what broke
 
 [The lessons log](docs/lessons.md) records actual implementation problems, fixes, and verification results. The [Milestone 1 design](docs/superpowers/specs/2026-10-05-mini-infer-m1-design.md) and [implementation plan](docs/superpowers/plans/2026-10-05-mini-infer-m1.md) explain the baseline scope. The [Milestone 2 design](docs/superpowers/specs/2026-10-05-mini-infer-m2-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m2.md) cover cached generation and measurements. The [Milestone 3 design](docs/superpowers/specs/2026-10-05-mini-infer-m3-design.md) and [plan](docs/superpowers/plans/2026-10-05-mini-infer-m3.md) cover static batching. The [Milestone 4 design](docs/superpowers/specs/2026-10-06-mini-infer-m4-design.md) and [plan](docs/superpowers/plans/2026-10-06-mini-infer-m4.md) cover scheduling and its measurements.
 
 The [Milestone 5 design](docs/superpowers/specs/2026-10-06-mini-infer-m5-design.md) and [plan](docs/superpowers/plans/2026-10-06-mini-infer-m5.md) cover page ownership, recovery and allocation measurements.
+
+The [Milestone 6 design](docs/superpowers/specs/2026-10-06-mini-infer-m6-design.md) and [plan](docs/superpowers/plans/2026-10-06-mini-infer-m6.md) cover int8 conversion and its quality/measurement gates.
 
 Code license: [MIT](LICENSE). Downloaded weights remain subject to their upstream license and are not included in this repository.

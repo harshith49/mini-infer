@@ -274,6 +274,7 @@ def main() -> None:
     parser.add_argument('--cache-backend', choices=('contiguous', 'paged'), default='contiguous')
     parser.add_argument('--num-pages', type=int, default=32)
     parser.add_argument('--page-size', type=int, default=16)
+    parser.add_argument("--int8", action="store_true", help="Store transformer projection weights as int8")
     args = parser.parse_args()
     try:
         if len(args.max_new_tokens) not in (1, len(args.prompt)) or any(n < 0 for n in args.max_new_tokens):
@@ -283,7 +284,7 @@ def main() -> None:
         settings = SamplingParams(args.temperature, args.top_k, args.top_p, args.seed)
         # This CLI loads public GPT-2; validate its default vocabulary before download.
         settings.validate(ModelConfig().vocab_size)
-        model, tokenizer = load_model(EngineConfig(device=args.device))
+        model, tokenizer = load_model(EngineConfig(device=args.device, int8=args.int8))
         device = model.token_embedding.weight.device
         pool = (PagePool(model.config, num_pages=args.num_pages, page_size=args.page_size,
             device=device, dtype=model.token_embedding.weight.dtype) if args.cache_backend == 'paged' else None)

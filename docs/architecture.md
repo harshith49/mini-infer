@@ -153,3 +153,22 @@ A scheduler attaches one matching, entirely free pool for exclusive use. Submiss
 The temporary masked batch cache stays contiguous. Each private paged layer is gathered, copied into the zero-initialized workspace, then released before the next gather or model forward. Only the new K/V column is scattered after successful logits. Peak K/V counts include the fixed resident pool, live workspace and one gather pair; owned page reservations are a subset of the pool, not extra storage. Rounded slots beyond capacity and unused slots within the logical budget are counted separately. This reference keeps full-budget reservation and gather overhead; it does not implement paged attention kernels, eviction, swapping, cancellation or multiple owners.
 
 `bench_paged` uses identical whole-page effective budgets. Clean capacity allocates real caches and measures the admitted FIFO prefix of supplied capacities. Fragmentation fills page-sized reservations, frees alternate ones, then probes two pages: contiguous is a coalescing first-fit metadata arena, while paged uses actual tensors/nonconsecutive IDs. Metadata reservation is logical capacity; its resident bytes and all process peaks remain unmeasured. The separate real-model correctness gate must pass before either experiment. These traces measure allocation capacity, not serving speed.
+
+## Int8 transformer projections
+
+```mermaid
+flowchart LR
+    Source[FP32 projection rows] --> Scale[One max-absolute scale per output row]
+    Scale --> Q[Round and clamp to int8 -127..127]
+    Q --> Store[Persistent int8 matrix + FP32 scales and bias]
+    Store --> Rebuild[Reconstruct current layer into FP32]
+    Input[FP32 activations] --> Linear[Floating linear matmul]
+    Rebuild --> Linear
+    Linear --> Release[Return result; release reconstruction]
+```
+
+`Int8Linear` changes weight storage, not activation or KV dtype. Conversion targets attention QKV/output and MLP up/down matrices; the tied vocabulary head remains the same floating embedding parameter. Checkpoint mapping happens first on CPU, the HF reference is released, all replacement projections are prepared and validated, then attached before device movement. No floating projection copy is retained. Whole-model storage accounting deduplicates shared underlying storages.
+
+Row scale is max absolute weight divided by127, with all-zero scale one and a smallest-normal FP32 floor for nonzero subnormals. Conversion uses double intermediates and rejects nonfinite sources/reconstructions. Each inference call casts the int8 matrix once and multiplies its scales in place before floating matmul. There is no persistent reconstruction cache; this is the source of measured CPU slowdown. Quantized models run through the same unmodified masks, positions, sampling and cache lifecycles.
+
+Quality scoring uses ordinary uncached model forwards over sliding windows. Each window includes context but scores only new next-token targets. Total double-precision NLL divided by target count is exponentiated once. The data URL/revision, source hash and selected token hash are recorded. The paired benchmark owns one model, finishes FP32 measurements, then converts it for int8 measurements; stage-local logits are released. Timings exclude quality, loading and conversion. Default FP32 correctness remains a separate mandatory gate.

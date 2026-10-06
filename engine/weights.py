@@ -90,4 +90,7 @@ def load_model(config: EngineConfig) -> tuple[GPT2Model, PreTrainedTokenizerBase
     model = GPT2Model(model_config)
     copy_hf_weights(model, reference.state_dict())
     del reference
+    if config.int8:
+        from engine.quantize import quantize_model
+        quantize_model(model)
     return model.to(device).eval(), tokenizer

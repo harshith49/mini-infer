@@ -112,3 +112,30 @@ M5 pre-review verification: 406 tests passed, five CUDA hardware checks skipped.
 ### Milestone 5 final review
 
 The fresh read-only reviewer found no critical, important or minor findings and independently reran 406 tests (five CUDA skips). All four allocation rows reproduced except sandbox hardware detection (`arm` versus the original escalated `Apple M5` detection). Whitespace passed, and M2/M4 CSVs were unchanged. No fix pass or deferred findings were needed. Execution retained the project-local manual ledger; its cost is manual upkeep. M5 is published as draft [PR #3](https://github.com/harshith49/mini-infer/pull/3), stacked on unmerged M4.
+
+## Milestone 6 — int8 transformer weights, October 6, 2026
+
+Per-output-row symmetric int8 conversion replaces the 48 transformer projections. Embeddings and their tied output head, biases and norms stay FP32; cache storage is unchanged. Conversion stages replacements before attaching them, so a late invalid source does not leave a mixed model. An all-zero row uses scale one, subnormal rows use a positive scale floor, and finite extremes are checked for FP32 reconstruction overflow. Forward reconstruction scales in place to avoid a second full floating weight temporary.
+
+The fixed public sample is the first 4,097 GPT-2 tokens from pinned Tiny Shakespeare text. Runtime download and cache reads verify its source checksum; the evaluator scores exactly 4,096 targets with context 1,024/stride 512. Independent window-oracle tests caught neither overlap double-counting nor target omissions. The source and token hashes accompany measurements; this small slice is not a general quality benchmark.
+
+The first public run exposed an incorrect assumption in the proposed raw-logit acceptance budgets: max absolute errors were 2.1811, 1.0604 and 8.1086, with RMSE 0.9690,0.4411 and 2.1856. A separate ordinary-Linear model using independently reconstructed int8 weights matched the quantized model exactly. Restoring original floating weights restored exact baseline logits. Most error was a common per-token vocabulary offset, which cancels in softmax. After removing that offset, maxima were 0.5505,0.3846,0.9081 and RMSE 0.07275,0.06000,0.06145. Mean distribution KL was 0.001304,0.001128,0.000835. Public cached and paged 50-token quantized outputs matched independent quantized generation.
+
+The same fixed text slice measured FP32 NLL 4.264483484/PPL 71.128171649 versus int8 NLL 4.250111963/PPL 70.113261975, a 1.4269% perplexity decrease. This passes the planned 5% increase gate. On October 7, 2026, the user approved applying the unchanged 2.0/.25 logit bounds after subtracting each token's vocabulary mean. Raw errors remain reported; additive offsets no longer fail the quantization-only gate. Original FP32 correctness gates have not changed.
+
+
+The actual isolated CPU benchmark records 497,759,232 FP32 weight bytes versus 243,287,040 int8-stage weight bytes, a 51.1236% reduction. Total model tensor bytes include another 12,582,912 bytes of causal masks; the largest reconstruction is 9,437,184 bytes. At 128 prompt tokens plus 32 outputs, throughput drops 89.02 to 24.06 tokens/s. Across tested lengths, int8 reaches 0.26–0.37× FP32 throughput. This reference trades speed for storage; no fused kernel or GPU speedup is claimed. The same single owned model is measured before/after conversion, and prior milestone CSVs remain unchanged.
+
+Before the approved amendment, integration verification reported 477 passed, 7 CUDA skips and 3 failing raw-logit acceptance tests (one for each public prompt). Real int8 single, static-batch and paged-scheduler CLI demonstrations succeeded. After the approved amendment, the full suite passed 480 tests with seven CUDA skips in 127 seconds. An additional int8 seeded-sampling/stops/global-RNG integration check passed separately before final review.
+
+
+### Milestone 6 final review and publication — October 7, 2026
+
+The fresh read-only reviewer independently ran **481 tests successfully, with seven CUDA hardware skips**, in 122.82 seconds. It found no Critical or Important issues, confirmed the eight CSV rows and approved comparison scope, and verified unchanged earlier CSVs and clean whitespace. M6 is published as draft [PR #4](https://github.com/harshith49/mini-infer/pull/4), stacked on unmerged M5.
+
+Two Minor findings are deferred:
+
+- A malformed programmatic projection bias length is not validated before conversion. Standard checkpoint loading checks shapes; an already-invalid custom model can be converted before its forward raises a dimension error.
+- Finite NLL as large as 1,000 overflows `math.exp`, producing an `OverflowError` traceback instead of the intended `ValueError`. The recorded GPT-2 results are unaffected.
+
+Execution rulings: retain the existing checkout/manual ledger (manual upkeep); progress independent benchmark work while awaiting the criterion decision (task-order bookkeeping); use the approved centered quantization gate (additive raw offsets are accepted, with raw errors retained). CUDA stays unverified because hardware is absent (device-specific issues may remain). Training and dtype-changing mixed precision remain outside this FP32 inference contract (they need a separate implementation). Allocation-failure recovery during conversion has no atomicity guarantee (reload a fresh FP32 model after such a failure). No blocking fix pass or second review was needed.
