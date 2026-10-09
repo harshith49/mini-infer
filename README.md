@@ -267,7 +267,7 @@ The first run downloads public weights and text into ignored `model_cache/`. Lat
 
 ## Honest limitations
 
-This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports single requests, static batches with a shared budget, and continuous requests with individual budgets/stops/sampling. The default baseline recomputes the full prefix; cached paths reserve contiguous storage by default, with optional paged private caches in the scheduler. Attention still reads the full prefix, and continuous batching copies temporary packed caches every step. No custom kernels, distributed execution, cancellation, asynchronous worker, or server exist yet. No comparison against vLLM has been measured.
+This is a learning project, not production-ready. Only standard GPT-2 inference is implemented; TinyLlama/RoPE/RMSNorm/SwiGLU/GQA are future work. Generation supports single requests, static batches with a shared budget, and continuous requests with individual budgets/stops/sampling. The default baseline recomputes the full prefix; cached paths reserve contiguous storage by default, with optional paged private caches in the scheduler. Attention still reads the full prefix, and continuous batching copies temporary packed caches every step. The HTTP server supports cancellation and one background inference worker. Custom kernels and distributed execution remain future work. No comparison against vLLM has been measured.
 
 ## What I learned / what broke
 

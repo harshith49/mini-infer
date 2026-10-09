@@ -16,7 +16,7 @@ import uvicorn
 from engine.config import EngineConfig
 from engine.model import GPT2Model
 from engine.weights import load_model
-from server.worker import AdmissionError, GenerationWorker, StreamHandle
+from server.worker import AdmissionError, GenerationWorker
 
 
 class GenerateRequest(BaseModel):
@@ -67,19 +67,23 @@ async def _admit(worker, request, payload):
             pass
     disconnect = asyncio.create_task(disconnected())
     try:
-        done, _ = await asyncio.wait([submission, disconnect], return_when=asyncio.FIRST_COMPLETED)
-        if disconnect in done:
-            raise HTTPException(499, 'Client disconnected')
-        return await submission
+        try:
+            done, _ = await asyncio.wait([submission, disconnect], return_when=asyncio.FIRST_COMPLETED)
+            if disconnect in done:
+                raise HTTPException(499, 'Client disconnected')
+            return await submission
+        finally:
+            disconnect.cancel()
+            await asyncio.gather(disconnect, return_exceptions=True)
     except BaseException:
+        # Cover cancellation even while joining the watcher after admission.
+        # A callback cannot itself be interrupted at another await boundary.
+        def dispose_accepted(future):
+            if not future.cancelled() and future.exception() is None:
+                worker._begin_release(future.result())
+        submission.add_done_callback(dispose_accepted)
         submission.cancel()
-        result, = await asyncio.gather(submission, return_exceptions=True)
-        if isinstance(result, StreamHandle):
-            await worker.release(result)
         raise
-    finally:
-        disconnect.cancel()
-        await asyncio.gather(disconnect, return_exceptions=True)
 
 
 def create_app(*, loader: Callable[[], tuple[GPT2Model, object]] | None = None,

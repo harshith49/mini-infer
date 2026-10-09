@@ -119,3 +119,105 @@ def test_cli_normal_interrupt_exits_without_traceback(monkeypatch):
         app.main()
     except KeyboardInterrupt:
         pytest.fail('Normal server interrupt escaped the CLI')
+
+
+@pytest.mark.parametrize('spec_version', ['2.3', '2.4'])
+@pytest.mark.parametrize('completed', [False, True])
+def test_shutdown_preserves_terminal_for_paused_response(spec_version, completed):
+    import asyncio
+    import threading
+    from server.app import GenerationResponse
+    from server.worker import GenerationWorker
+    from test_server_worker import payload
+    model = tiny_model()
+    entered, unblock = threading.Event(), threading.Event()
+    calls = 0
+    def block_decode(module, args):
+        nonlocal calls
+        calls += 1
+        if not completed and calls == 2:
+            entered.set()
+            assert unblock.wait(5)
+    hook = model.register_forward_pre_hook(block_decode)
+    async def check():
+        worker = GenerationWorker(lambda: (model, Tokenizer()), cache_backend='paged')
+        await worker.start()
+        task = None
+        resume = asyncio.Event()
+        try:
+            handle = await worker.submit(payload(budget=3))
+            sending = asyncio.Event()
+            bodies = []
+            async def send(message):
+                if message['type'] == 'http.response.body':
+                    bodies.append(message['body'])
+                    if len(bodies) == 1:
+                        sending.set()
+                        await resume.wait()
+            async def receive():
+                await asyncio.Event().wait()
+            task = asyncio.create_task(GenerationResponse(worker, handle)(
+                dict(type='http', asgi={'spec_version': spec_version}), receive, send))
+            await asyncio.wait_for(sending.wait(), 5)
+            if completed:
+                async with asyncio.timeout(5):
+                    while not handle.terminal:
+                        await asyncio.sleep(0)
+                await worker.stop()
+            else:
+                assert await asyncio.to_thread(entered.wait, 5)
+                stopping = asyncio.create_task(worker.stop())
+                await asyncio.sleep(0)
+                unblock.set()
+                await asyncio.wait_for(stopping, 5)
+            resume.set()
+            await asyncio.wait_for(task, 1)
+            events = decode_events(b''.join(bodies).decode())
+            assert events[-1][0] == ('done' if completed else 'error')
+            assert sum(kind in ('done', 'error') for kind, _ in events) == 1
+            assert not worker._handles and not worker.thread.is_alive()
+            assert worker.scheduler.page_pool.owned_pages == 0
+        finally:
+            unblock.set()
+            resume.set()
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await worker.stop()
+    try:
+        asyncio.run(check())
+    finally:
+        unblock.set()
+        hook.remove()
+
+
+@pytest.mark.parametrize('cancellations', [1, 2])
+def test_admission_handoff_cancellation_disposes_accepted_handle(cancellations):
+    import asyncio
+    from server.app import _admit
+    from server.worker import GenerationWorker
+    from test_server_worker import payload
+    async def check():
+        worker = GenerationWorker(lambda: (tiny_model(), Tokenizer()), max_outstanding=1)
+        await worker.start()
+        accepted = []
+        class Request:
+            async def receive(self):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    accepted.extend(worker._handles.values())
+                    for _ in range(cancellations):
+                        asyncio.get_running_loop().call_soon(admitting.cancel)
+                    raise
+        try:
+            admitting = asyncio.create_task(_admit(worker, Request(), payload(budget=0)))
+            with pytest.raises(asyncio.CancelledError):
+                await admitting
+            handle, = accepted
+            assert handle.cancelled.is_set() and handle.cleanup is not None
+            await asyncio.wait_for(asyncio.shield(handle.cleanup), 5)
+            assert not worker._handles and not worker.scheduler._requests
+        finally:
+            await worker.stop()
+    asyncio.run(check())

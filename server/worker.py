@@ -153,7 +153,13 @@ class GenerationWorker:
             self._enqueue(('stop', None, None))
         if self.thread is not None:
             await asyncio.to_thread(self.thread.join)
-        await asyncio.gather(*(self.release(h) for h in list(self._handles.values())))
+        # Backend disposal is complete, but live transports still own their
+        # terminal events. Only transport release may drain those queues.
+        handles = list(self._handles.values())
+        for handle in handles:
+            self._resolve(handle.disposed)
+            self._handles.pop(handle.request_id, None)
+        await asyncio.gather(*(asyncio.shield(h.cleanup) for h in handles if h.cleanup is not None))
         self._state = 'stopped'
 
     def _deliver(self, handle, kind, data):
