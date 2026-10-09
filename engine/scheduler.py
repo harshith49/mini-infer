@@ -55,12 +55,13 @@ class Scheduler:
         self.model = model
         self.max_batch_size = max_batch_size
         self.pad_token_id = pad_token_id
-        # ponytail: retain completed results; add eviction when the server owns lifetimes.
+        # Completed results remain available until explicitly discarded/cancelled.
         self._requests: dict[str, _Request] = {}
         self._waiting: deque[str] = deque()
         self._running: list[str] = []
         self._pending_events: list[TokenEvent] = []
         self.peak_kv_bytes = self.pool_resident_bytes
+        self.peak_forward_batch_size = 0
 
     @property
     def idle(self) -> bool:
@@ -109,6 +110,25 @@ class Scheduler:
         if request.finish_reason is None:
             raise ValueError('Request has not finished')
         return request.output.clone()
+
+    def cancel(self, request_id: str) -> None:
+        request = self._requests.pop(request_id, None)
+        if request is not None:
+            if isinstance(request.cache, PagedKVCache):
+                request.cache.close()
+            request.cache = None
+        self._waiting = deque(name for name in self._waiting if name != request_id)
+        self._running = [name for name in self._running if name != request_id]
+        self._pending_events = [e for e in self._pending_events if e.request_id != request_id]
+
+    def discard(self, request_id: str) -> None:
+        if self._requests[request_id].finish_reason is None:
+            raise ValueError('Request has not finished')
+        self.cancel(request_id)
+
+    def close(self) -> None:
+        for request_id in list(self._requests):
+            self.cancel(request_id)
 
     def _cache(self, batch_size: int, capacity: int) -> SimpleKVCache:
         weight = self.model.token_embedding.weight
@@ -168,6 +188,7 @@ class Scheduler:
                 mask[row, -len(request.prompt):] = True
             workspace = self._cache(len(positive), width)
             self._record_peak(workspace)
+            self.peak_forward_batch_size = max(self.peak_forward_batch_size, len(positive))
             logits = self.model(ids, cache=workspace, attention_mask=mask)
             for row, request in enumerate(positive):
                 tokens[request.request_id] = sample(logits[row, -1], request.sampling, generator=request.generator)
@@ -219,6 +240,7 @@ class Scheduler:
             mask[row, past-length:] = True
         self._record_peak(workspace)
         ids = torch.stack([r.output[-1] for r in requests])[:, None]
+        self.peak_forward_batch_size = max(self.peak_forward_batch_size, len(requests))
         logits = self.model(ids, cache=workspace, attention_mask=mask)
         tokens = [sample(logits[row, -1], r.sampling, generator=r.generator) for row, r in enumerate(requests)]
         del logits

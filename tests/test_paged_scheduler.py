@@ -299,3 +299,26 @@ def test_cli_paged_impossible_request_errors_cleanly(model, monkeypatch, capsys)
     with pytest.raises(SystemExit) as error:
         scheduler.main()
     assert error.value.code == 2 and 'pool' in capsys.readouterr().err
+
+
+def test_disposal_returns_pages_after_partial_step_failure(model):
+    s, pool = scheduler_for(model, pages=8, limit=2)
+    s.submit('A', torch.tensor([1]), 5)
+    s.step()
+    s.submit('B', torch.tensor([2]), 3)
+    calls = 0
+    def fail_second(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError('decode fault')
+    hook = model.lm_head.register_forward_hook(fail_second)
+    with pytest.raises(RuntimeError):
+        s.step()
+    hook.remove()
+    assert s._pending_events and pool.owned_pages
+    s.cancel('B')
+    assert not s._pending_events
+    s.close()
+    s.close()
+    assert pool.owned_pages == 0 and s.idle and not s._requests
