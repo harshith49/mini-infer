@@ -148,8 +148,11 @@ def main() -> None:
     selected = create_app(engine_config=EngineConfig(device=args.device,int8=args.int8),
         max_batch_size=args.max_batch_size,max_outstanding=args.max_outstanding,
         cache_backend=args.cache_backend,num_pages=args.num_pages,page_size=args.page_size)
-    asyncio.run(ServingServer(uvicorn.Config(selected, host=args.host, port=args.port,
-        workers=1, access_log=False)).serve())
+    try:
+        asyncio.run(ServingServer(uvicorn.Config(selected, host=args.host, port=args.port,
+            workers=1, access_log=False)).serve())
+    except KeyboardInterrupt:
+        pass  # Uvicorn has already completed coordinated shutdown.
 
 
 if __name__ == '__main__':

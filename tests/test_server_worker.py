@@ -152,6 +152,10 @@ def test_worker_slow_consumer_is_bounded_and_does_not_block_other_jobs():
         slow = await worker.submit(payload(budget=12))
         peer = await worker.submit(payload(budget=3))
         assert (await collect(peer))[-1][0] == 'done'
+        async with asyncio.timeout(5):
+            while not slow.terminal:
+                await asyncio.sleep(.001)
+        assert slow.events.qsize() == 13
         assert (await collect(slow))[-1][0] == 'done'
         assert slow.events.maxsize == 13 and len(worker._handles) == 2
         assert not worker.scheduler._requests

@@ -82,3 +82,40 @@ def test_cli_rejects_bad_settings_before_loading(monkeypatch, flags):
     with pytest.raises(SystemExit) as e:
         app.main()
     assert e.value.code == 2
+
+
+def test_response_header_send_failure_still_disposes_handle():
+    import asyncio
+    from server.app import GenerationResponse
+    from server.worker import GenerationWorker
+    from starlette.requests import ClientDisconnect
+    from test_server_worker import payload
+    async def check():
+        worker=GenerationWorker(lambda:(tiny_model(),Tokenizer()))
+        await worker.start()
+        try:
+            handle=await worker.submit(payload(budget=0))
+            response=GenerationResponse(worker,handle)
+            async def send(message):
+                raise OSError('closed transport')
+            async def receive():
+                await asyncio.Event().wait()
+            with pytest.raises(ClientDisconnect):
+                await response(dict(type='http',asgi={'spec_version':'2.4'}),receive,send)
+            assert not worker._handles
+        finally:
+            await worker.stop()
+    asyncio.run(check())
+
+
+def test_cli_normal_interrupt_exits_without_traceback(monkeypatch):
+    from server import app
+    def interrupt(awaitable):
+        awaitable.close()
+        raise KeyboardInterrupt
+    monkeypatch.setattr(app.asyncio,'run',interrupt)
+    monkeypatch.setattr(sys,'argv',['server','--device','cpu'])
+    try:
+        app.main()
+    except KeyboardInterrupt:
+        pytest.fail('Normal server interrupt escaped the CLI')

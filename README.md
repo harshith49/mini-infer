@@ -1,10 +1,10 @@
-LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that shows exactly how to reclaim both, with every optimization measured.
+mini-infer measures KV caching, batching, paged allocation, int8 weight storage and HTTP serving in a small custom GPT-2 engine.
 
 # mini-infer
 
 A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and measured CPU KV-cache benchmarks.
 
-**Current status: Milestone 6, int8 transformer weights.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; serving comes later.
+**Current status: Milestone 7, streaming HTTP serving.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; streaming serving and client latency measurements are now available.
 
 ## Quick start
 
@@ -100,7 +100,7 @@ outputs = [scheduler.result(name) for name in ["short", "long"]]
 
 The API returns unpadded prompt-plus-output IDs. Requests can arrive between steps. FIFO admission fills free slots; newly admitted requests prefill together, then previously running requests decode together. Completion frees slots for the next step. Events follow admission-then-decode order. Zero budgets complete without forwarding; multiple stop IDs are supported and the selected stop token stays in the result. Finite budgets and successful forwards ensure eventual FIFO admission.
 
-Private caches reserve each request's prompt-plus-budget capacity and contain only real tokens. Decoding temporarily packs left-padded prefixes and copies back one new K/V column. Those copies and simultaneous private/temporary storage cost time and memory. `cache_allocated_bytes` reports current private storage; `peak_kv_bytes` includes simultaneous workspaces. Completed results remain until the scheduler is discarded. The API has one synchronous owner. A forward failure leaves that phase retryable; events from an earlier successful phase are delivered once on the next successful step.
+Private caches reserve each request's prompt-plus-budget capacity and contain only real tokens. Decoding temporarily packs left-padded prefixes and copies back one new K/V column. Those copies and simultaneous private/temporary storage cost time and memory. `cache_allocated_bytes` reports current private storage; `peak_kv_bytes` includes simultaneous workspaces. Completed results remain until explicit `discard`, `cancel`, `close`, or disposal of the scheduler. The API has one synchronous owner. A forward failure leaves that phase retryable; events from an earlier successful phase are delivered once on the next successful step.
 
 ## Paged KV cache
 
@@ -161,7 +161,7 @@ Scheduler acceptance adds 50-token public greedy comparisons with active limits 
 
 Paged acceptance additionally checks all 50 direct cached suffix logits against contiguous cached execution at the same tolerance, nonconsecutive page reuse, poisoned tails, pressure-driven admission, seeded scheduling parity, and failed-forward page cleanup. The M4 additional public suffix gate stays unchanged.
 
-Run the same suite after every later milestone. Preserve this uncached baseline to check optimizations independently. Quantization will use separate quality criteria because it can change greedy tokens.
+Run the same suite after every later milestone. Preserve this uncached baseline to check optimizations independently. Quantization uses separate quality criteria because it can change greedy tokens.
 
 ## Roadmap and measurement status
 
@@ -173,6 +173,7 @@ Run the same suite after every later milestone. Preserve this uncached baseline 
 | Continuous batching | 69.52 useful tokens/s* | Not measured | Implemented and checked on CPU |
 | Paged KV | Capacity/fragmentation below; throughput unmeasured | Not measured | Implemented and checked on CPU |
 | int8 transformer weights | 51.12% fewer weight bytes; 24.06 tokens/s** | Not measured | Implemented and checked on CPU |
+| HTTP SSE serving | 128.25 / 114.37 tokens/s at concurrency 1 / 4*** | Not measured | Implemented and checked on CPU |
 
 *Batch rows use the mixed workload below and are not comparable to the single-request values. Naive/KV representative values use **128 prompt tokens + 32 generated tokens**, GPT-2 FP32 on **Apple M5 CPU**, one PyTorch thread, one warmup, and three measured repetitions. Throughput includes prefill and cache allocation. These are instrumented synthetic token-ID workloads, not production traffic or GPU figures.
 
@@ -201,7 +202,9 @@ Optional flags: `--prompt-lengths 16 64 128 256`, `--max-new-tokens 32`, `--repe
 - **int8 weight-only quantization:** store linear weights with fewer bytes. Dequantization adds work and approximation can affect quality.
 - **Streaming serving:** expose concurrent requests through a scheduler and SSE endpoint. Requires cancellation and lifecycle handling.
 
-Naive-versus-KV and fixed-cohort-versus-continuous benchmarks are implemented. Charts, HF/vLLM comparisons, the streaming server, Docker, CI, and a Colab notebook are not implemented yet. Later results will include hardware, workload, latency, and memory context; GPU cells will stay unmeasured until actual GPU runs.
+Naive-versus-KV and fixed-cohort-versus-continuous benchmarks are implemented. Streaming serving and client load measurements are implemented. Charts, HF/vLLM comparisons, Docker, CI, and a Colab notebook remain M8 work. Later results will include hardware, workload, latency, and memory context; GPU cells will stay unmeasured until actual GPU runs.
+
+***HTTP rows use the text prompt and workload in the M7 section; they include delivery/parsing overhead and are single-run measurements.
 
 ## Mixed-request batching measurements
 
@@ -274,4 +277,49 @@ The [Milestone 5 design](docs/superpowers/specs/2026-10-06-mini-infer-m5-design.
 
 The [Milestone 6 design](docs/superpowers/specs/2026-10-06-mini-infer-m6-design.md) and [plan](docs/superpowers/plans/2026-10-06-mini-infer-m6.md) cover int8 conversion and its quality/measurement gates.
 
+The [Milestone 7 design](docs/superpowers/specs/2026-10-10-mini-infer-m7-design.md) and [plan](docs/superpowers/plans/2026-10-10-mini-infer-m7.md) cover HTTP streaming, request cleanup and client measurement.
+
 Code license: [MIT](LICENSE). Downloaded weights remain subject to their upstream license and are not included in this repository.
+
+## Streaming HTTP generation (M7)
+
+Start one local model worker, then stream tokens from another terminal:
+
+```bash
+python -m server.app --device cpu --threads 1 --max-batch-size 2
+curl -N http://127.0.0.1:8000/v1/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"The future of machine learning is","max_new_tokens":32,"stop_token_ids":[]}'
+```
+
+The POST accepts `prompt` (required, up to 65,536 characters), `max_new_tokens` (default 50), `temperature` (0), `top_k` (0), `top_p` (1), `seed` (0), and `stop_token_ids` (EOS by default; `[]` disables stopping). Unknown fields, type coercions, nonfinite sampling values and prompt-plus-output overflow reject with JSON 422 before SSE headers. Empty text uses one EOS seed and zero budget is valid. Capacity exhaustion returns 429; an unavailable/failed worker returns 503.
+
+Every selected token emits `event: token` with JSON `request_id`, `token_id`, and `delta`. `event: done` contains the same ID, generated-only `token_ids`, original-prompt-plus-generated `text`, `finish_reason` (`length` or `stop`), `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`), and `server_peak_forward_batch_size`. Stop IDs count in usage, even when decoded special-token text is empty. Runtime failure sends `event: error` with a stable code/message and closes without a final `done`; restart the server after a worker failure.
+
+Append token deltas to build text. A byte-split Unicode character or a literal trailing replacement character can delay a delta; empty deltas still carry valid token IDs. The finishing token flushes all remaining decoded text. The original prompt is preserved verbatim, and the artificial seed for empty prompts is counted but hidden.
+
+One background thread owns inference and enables overlapping requests to share scheduler batches. Default outstanding-stream limit is 64 (`--max-outstanding`), including completed but undrained streams. Token budgets bound each response queue; slow consumers cannot block another generation. Disconnect cleanup returns request pages/state and releases the slot after worker acknowledgment. Cancellation and shutdown allow the current forward to finish. Use the supported module command for coordinated shutdown; a permanently stuck backend needs process termination. This milestone runs one process and has no reconnect/session protocol.
+
+Use `--cache-backend paged --num-pages 32 --page-size 16` or `--int8` to reuse the existing engine options. Requests with positive output budgets must individually fit a paged pool. `--device auto` selects available CUDA or CPU; CUDA serving remains unmeasured on this host.
+
+Run the validated load test after starting the server. Hardware/device/cache flags describe the server you launched and are labeled operator-declared in the CSV:
+
+```bash
+python -m benchmarks.load_test --requests 8 --concurrency 1 \
+  --server-device cpu --server-hardware 'Apple M5' --server-threads 1 \
+  --server-max-batch-size 2 --server-cache-backend contiguous
+python -m benchmarks.load_test --requests 8 --concurrency 4 \
+  --server-device cpu --server-hardware 'Apple M5' --server-threads 1 \
+  --server-max-batch-size 2 --server-cache-backend contiguous
+```
+
+Each run warms up separately, then requests exactly 32 outputs with seed zero/no EOS stop. Useful tokens divided by first-launch-to-last-finish elapsed time give throughput. Whole-request latency and first-token arrival use p50/p95 linear-interpolated percentiles; zero-token requests have no TTFT sample. HTTP, timeout, malformed/truncated SSE and mismatched final results fail the run without appending a successful row. The reported batch peak covers the server lifetime, including warmup/previous runs; it does not establish the peak of that individual workload.
+
+Measured on Apple M5 CPU, one thread, FP32/contiguous KV, batch limit 2; each row has 8 requests and 256 useful output tokens, with a separate warmup:
+
+| Client concurrency | Tokens/s | Request latency p50 / p95 | TTFT p50 / p95 | Lifetime batch peak |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 128.25 | 247.88 / 253.07 ms | 16.13 / 16.72 ms | 1 |
+| 4 | 114.37 | 1,115.17 / 1,130.25 ms | 582.07 / 593.85 ms | 2 |
+
+Raw data: [serving.csv](results/serving.csv). These are two single-run smoke measurements, not repeated benchmark medians. The concurrent run achieved real batching but lower throughput and higher client latency on this CPU. They include delivery overhead and use a different workload from prior engine-only CSVs; CPU process peak memory and CUDA performance are unmeasured.
