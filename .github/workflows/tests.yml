@@ -22,6 +22,16 @@ jobs:
       - run: python -m pip install -r requirements.txt
       - run: python -m pip check
       - run: python -m pytest -q
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
       - name: Build CPU container
         run: docker build -t mini-infer .
       - name: Check container generation
@@ -30,7 +40,7 @@ jobs:
         run: |
           docker run -d --name mini-infer-smoke -p 127.0.0.1:8000:8000 -v "$PWD/model_cache:/app/model_cache" mini-infer
           trap 'docker logs mini-infer-smoke; docker rm -f mini-infer-smoke' EXIT
-          curl --fail --retry 30 --retry-connrefused --retry-delay 2 --max-time 5 http://127.0.0.1:8000/openapi.json > /dev/null
+          curl --fail --retry 30 --retry-all-errors --retry-delay 2 --max-time 5 http://127.0.0.1:8000/openapi.json > /dev/null
           curl --fail --max-time 60 -N http://127.0.0.1:8000/v1/generate -H 'Content-Type: application/json' -d '{"prompt":"Hello, world!","max_new_tokens":2,"stop_token_ids":[]}' > /tmp/container-sse.txt
           python - <<'CHECK'
           import json
