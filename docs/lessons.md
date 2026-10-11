@@ -167,3 +167,46 @@ Final review rulings: CUDA remains unverified (device-specific issues may remain
 Post-fix acceptance: **559 passed, seven CUDA skips**, one HTTPX migration warning, in 125.23 seconds. The single fix pass resolves both Important findings; compileall/whitespace checks pass and prior measurements remain unchanged.
 
 M7 is published as draft [PR #5](https://github.com/harshith49/mini-infer/pull/5), stacked on unmerged M6. The independent reviewer ran the original 553-test suite with seven CUDA skips in 169.16 seconds; the executor ran the 559-test post-fix suite. Repository name/description and matching local/remote/PR implementation heads were verified before recording publication. No M7 findings remain deferred; the inherited M6 limitations above remain documented.
+
+## M8: comparable workloads and packaging
+
+The six-stage runner reuses existing generation/scheduler/pool APIs and preserves legacy M2 command/schema. RED missing-module checks preceded implementation. Targeted tests cover unequal budget trimming, deterministic output, ownership cleanup, exact metric arithmetic, context/pool rejection and atomic result replacement. CPU process memory stays unmeasured; analytical model/KV bytes never fill that column.
+
+The HF reference regression used an EOS list covering every vocabulary token. Transformers 4.48.3 unexpectedly fills a separate GenerationConfig's `None` EOS from checkpoint defaults; explicit `generate` kwargs against the model configuration override it correctly. The test failed before the fix and passes with full budgets and exact tokens. Two additional subprocess regressions showed importing Transformers before the shared loader captured a home-cache path; reference classes now import through `engine.weights`, setting the project-local cache first.
+
+Headless Matplotlib 3.10.8 was verified against Python 3.11, installed and pinned; `pip check` passes. Chart validation rejects incomplete/mixed/nonfinite measurements. A CUDA-unmeasured fixture caught a hardcoded CPU label; dynamic device annotation fixes it. Rendered smoke layouts were inspected. Source metadata: [Matplotlib PyPI](https://pypi.org/project/matplotlib/3.10.8/), [vLLM 0.8.5 offline API](https://docs.vllm.ai/en/v0.8.5/api/offline_inference/llm.html), [checkout](https://github.com/actions/checkout), [setup-python](https://github.com/actions/setup-python).
+
+Docker is unavailable here, so its CPU recipe is not claimed executed. The Colab notebook has no outputs/secrets and valid JSON/code cells, but T4 execution remains unverified. Optional vLLM is absent and its actual skip path produces no CSV; simulated failure tests prove installed-engine faults are not swallowed. Hosted CI remains separate from local suite evidence. Final isolated measurements and final review follow these implementation checks.
+
+Isolated fresh M8 measurements on Apple M5 CPU, one thread and three repetitions: naive 20.50, KV cache 118.63, static cohorts 60.15, continuous 101.79, paged 90.30, paged+int8 40.64 useful tokens/s. All rows produce 216 useful tokens; static computes 168 extras. Sequential HF pairing measured mini-infer 120.07 versus HF 114.37 tokens/s with token-exact outputs. Fresh pinned-slice perplexity is FP32 71.1282 and int8 70.1133 (1.43% lower), preserving the 5% maximum-increase gate. CPU peak and all GPU/vLLM performance remain unmeasured. Prior milestone CSVs are unchanged.
+
+Full product tree before isolated measurements: **600 passed, eight CUDA skips**, one pinned HTTPX migration warning in 132.89 seconds. This precedes the final review fix pass described below. Compile/dependency/whitespace checks and a cached public-model CPU demo are acceptance checks.
+
+
+The single independent M8 review found two Important validation gaps, with no Critical or Minor findings. A benchmark could credit a requested budget when both its expected and actual outputs were consistently short; chart compatibility omitted recorded software and page settings. Twelve new regression cases failed before the fix. Shared `measure` now independently checks request count, one-dimensional int64 outputs and prompt-plus-budget lengths for both expected and actual tensors. Charts require matching nonempty Python/PyTorch versions, the correct per-stage cache backend, matching positive paged settings and blank page settings elsewhere. The affected/reference suite passes 55 tests with one CUDA skip. Existing recorded CSVs pass the stronger checks; their arithmetic and valid-run timing behavior did not change, so measurements were retained.
+
+M8 execution and review rulings, with their costs:
+
+- Retain the approved native checkout and manual ledger: manual bookkeeping replaces wrapper automation.
+- Retain the user's existing branch-push/draft-PR authorization: commits become public; no merge or release tag is performed.
+- CUDA execution/peaks/parity were unavailable: conditional tests cannot rule out device-specific issues.
+- Colab/T4 execution was unavailable: structural/code checks cannot rule out external-runtime problems.
+- Installed vLLM execution was unavailable: boundary checks cannot rule out API/backend incompatibility.
+- Docker execution was unavailable: recipe inspection cannot confirm a working image.
+- Hosted Actions execution was outside the independent review: local tests cannot confirm hosted-runner behavior.
+- Independent performance re-timing was excluded, and the validation-only fixes retain valid recorded runs: arithmetic/scope checks do not establish statistical reproduction.
+- The reviewer ran affected tests rather than the full inherited suite: independent coverage is narrower; executor full-suite evidence supplies integration coverage.
+- Atomic replacement does not promise power-loss durability: no fsync crash-durability guarantee.
+- New engine/server architecture is outside M8: existing behavior is retained without broader architecture validation.
+- Publication/head equality is checked separately after pushing: local acceptance alone cannot establish remote publication.
+
+No M8 Minor findings are deferred. The two inherited M6 malformed-bias/extreme-NLL limitations remain documented above.
+
+Post-review acceptance: **614 passed, eight CUDA skips**, one inherited HTTPX warning in 132.42 seconds. Compileall, pip check, whitespace and stricter chart validation pass; prior CSVs remain unchanged. Both Important findings are resolved in one executor fix pass, with no second independent review.
+
+M8 is published as draft [PR #6](https://github.com/harshith49/mini-infer/pull/6), stacked on unmerged M7. The implementation commit `efcf71d0833f23513dc99264d454cfb45c6b9959` matched local, remote and PR heads before this publication record. All eight milestones are implemented on the M8 branch; no merge or release tag was performed. Final documentation heads are verified after pushing this record.
+
+
+Remaining validation follow-up: hosted [CPU CI](https://github.com/harshith49/mini-infer/actions/runs/38134037300) passed 614 tests/eight CUDA skips/two dependency deprecation warnings in 491.11 seconds. A Docker-enabled hosted run built the CPU image and passed 50-token generation, then exposed a readiness-check race: Docker resets connections before model startup, which curl's connection-refused retry does not cover. A local HTTP reset fixture reproduced failure with the old retry flag and success with bounded `--retry-all-errors` GET retries. Docker validation now runs as an independent CI job; the generation POST is never retried. Complete server validation follows the fixed hosted run.
+
+Hosted [Docker validation](https://github.com/harshith49/mini-infer/actions/runs/38139168533/job/114469260582) passed on Linux amd64 after the bounded readiness fix: image build, 50-token public GPT-2 generation, default server startup, exactly two token events plus one terminal event, matching token IDs and usage. The pull-request-triggered Docker job also passed. CPU and Docker validation gaps are now closed; actual CUDA/T4/Colab and installed vLLM runs still require an accessible GPU runtime. This is validation/configuration work; engine/server implementation and the recorded performance CSVs remain unchanged.

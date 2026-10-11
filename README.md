@@ -1,10 +1,10 @@
-mini-infer measures KV caching, batching, paged allocation, int8 weight storage and HTTP serving in a small custom GPT-2 engine.
+LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that shows exactly how to reclaim both, with every optimization measured.
 
 # mini-infer
 
-A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and measured CPU KV-cache benchmarks.
+A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and honest CPU measurements. Optimizations have costs: paging can waste rounded space, reference int8 can be slower, and CPU results do not establish GPU improvements.
 
-**Current status: Milestone 7, streaming HTTP serving.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; streaming serving and client latency measurements are now available.
+**Current status: all eight milestones implemented; M8 review findings resolved.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; streaming serving and client latency measurements are now available.
 
 ## Quick start
 
@@ -202,7 +202,7 @@ Optional flags: `--prompt-lengths 16 64 128 256`, `--max-new-tokens 32`, `--repe
 - **int8 weight-only quantization:** store linear weights with fewer bytes. Dequantization adds work and approximation can affect quality.
 - **Streaming serving:** expose concurrent requests through a scheduler and SSE endpoint. Requires cancellation and lifecycle handling.
 
-Naive-versus-KV and fixed-cohort-versus-continuous benchmarks are implemented. Streaming serving and client load measurements are implemented. Charts, HF/vLLM comparisons, Docker, CI, and a Colab notebook remain M8 work. Later results will include hardware, workload, latency, and memory context; GPU cells will stay unmeasured until actual GPU runs.
+All eight milestones are implemented, including comparable stage/HF benchmarks, charts, an optional vLLM runner, Docker, CI and a Colab notebook. The M8 results below record hardware, workload, latency and memory scope. GPU and Colab execution remain unverified; hosted CPU and Docker checks passed.
 
 ***HTTP rows use the text prompt and workload in the M7 section; they include delivery/parsing overhead and are single-run measurements.
 
@@ -323,3 +323,83 @@ Measured on Apple M5 CPU, one thread, FP32/contiguous KV, batch limit 2; each ro
 | 4 | 114.37 | 1,115.17 / 1,130.25 ms | 582.07 / 593.85 ms | 2 |
 
 Raw data: [serving.csv](results/serving.csv). These are two single-run smoke measurements, not repeated benchmark medians. The concurrent run achieved real batching but lower throughput and higher client latency on this CPU. They include delivery overhead and use a different workload from prior engine-only CSVs; CPU process peak memory and CUDA performance are unmeasured.
+
+
+## Reproduce the complete experiment (M8)
+
+Use the same workload across six stages; the legacy M2 command remains available:
+
+```bash
+python -m benchmarks.bench_stages --suite all --device cpu
+python -m benchmarks.bench_vs_hf --device cpu
+python -m benchmarks.make_charts --input results/stages.csv
+```
+
+The default workload uses eight seed-zero synthetic token prompts of lengths `[16,64,32,128,16,64,32,128]`, budgets `[4,32,8,64,4,32,8,64]`, batch limit two, one untimed warmup and three measured repetitions. All stages produce **216 useful new tokens** per repetition with EOS stopping disabled. Synthetic tokens measure inference mechanics, not language quality.
+
+Apple M5 CPU, FP32 except int8 projection storage in the final paged stage; one thread, batch limit two, three measured repetitions:
+
+| Stage | Useful tokens/s | Request p50 / p95 seconds | CPU process peak | CUDA results |
+| --- | ---: | ---: | --- | --- |
+| naive | 20.50 | 5.272 / 10.524 | Unmeasured | Unmeasured |
+| kv_cache | 118.63 | 0.950 / 1.820 | Unmeasured | Unmeasured |
+| static_batching | 60.15 | 2.080 / 3.684 | Unmeasured | Unmeasured |
+| continuous_batching | 101.79 | 1.079 / 2.118 | Unmeasured | Unmeasured |
+| paged_kv | 90.30 | 1.179 / 2.390 | Unmeasured | Unmeasured |
+| int8 | 40.64 | 2.343 / 5.310 | Unmeasured | Unmeasured |
+
+Raw data: [stages.csv](results/stages.csv). Static cohorts compute 168 extra trimmed tokens; all rows count 216 useful tokens. KV caching wins on this workload; static batching is slower than sequential cached generation, and paged/int8 stages are slower than continuous FP32. These are workload-specific CPU measurements, not GPU or general speed guarantees. Fresh quality scoring gives FP32 perplexity **71.1282**, int8 **70.1133**, a **1.43% decrease** on the pinned 4,096-target slice; this passes the 5% maximum-increase gate without establishing broader quality improvement.
+
+
+Each repetition begins at common request submission. Sequential latency ends at each request return, static latency at cohort return, and continuous latency at completion-event delivery; all include queue waiting. Tokens/s divides useful tokens by median whole-workload elapsed time. Request p50/p95 use linear interpolation over all measured repetitions. Static cohorts compute extra tokens before trimming to each budget. The last stage is **paged KV plus int8 weights**, with FP32 compute. Loading, tokenization, warmup, conversion, quality scoring and post-run comparisons are outside timers; inference validation, allocation, sampling, copies and output materialization are included.
+
+CPU process peak is **unmeasured**, including in the memory chart. CUDA peak, when measured, is PyTorch allocated tensors including the active model; driver/process totals and reserved allocator memory are excluded. KV/pool/workspace and resident model tensor bytes have separate CSV scopes. The int8 row must pass the existing checksum-pinned public-text perplexity gate (maximum 5% increase); it is compared with its own greedy warmup because quantization may change tokens. Five FP32 stages must match independent generation exactly. An error preserves the previous complete CSV rather than publishing partial stages.
+
+Measured separately on the same Apple M5 CPU workload:
+
+| Sequential cached implementation | Useful tokens/s | Request p50 / p95 seconds |
+| --- | ---: | ---: |
+| mini_infer_cached | 120.07 | 0.920 / 1.799 |
+| hf_cached | 114.37 | 0.971 / 1.888 |
+
+Raw pairing: [vs_hf.csv](results/vs_hf.csv). Both implementations pass exact-token checks. This is a three-repetition CPU measurement, not a claim of consistent superiority.
+
+The HF file is a separate paired experiment: sequential cached mini-infer versus eager FP32 `GPT2LMHeadModel.generate` on identical token prompts/budgets. Models are measured separately; both have greedy fixed outputs and matching threads/device. This is not an HF continuous scheduler comparison. Earlier milestone tables retain their original workload scope.
+
+### Colab and optional vLLM
+
+Open [colab_benchmark.ipynb](notebooks/colab_benchmark.ipynb) in Colab, choose a GPU runtime and run cells in order. It creates a separate pinned virtual environment, prints actual GPU information, runs the full tests, then writes stage/HF CSVs and charts. The revision defaults to `codex/mini-infer-m8`; replace it with a reviewed SHA, or `main` after merge. Correctness failure stops benchmarks. The T4 path has not been executed here; GPU results remain unmeasured. The notebook explicitly allows a CPU-labeled fallback. Python 3.11/3.12 is required for the pinned Torch wheels.
+
+On a compatible CUDA host:
+
+```bash
+python -m pytest -q
+python -m benchmarks.bench_stages --suite all --device cuda --output results/stages_cuda.csv
+python -m benchmarks.bench_vs_hf --device cuda --output results/vs_hf_cuda.csv
+python -m benchmarks.make_charts --input results/stages_cuda.csv
+```
+
+Optional vLLM uses a **separate Python 3.11 CUDA environment**, following its [0.8.5 GPU installation guide](https://docs.vllm.ai/en/v0.8.5/getting_started/installation/gpu.html). Install `vllm==0.8.5` and `httpx`, then run `python -m benchmarks.bench_vs_vllm` from this checkout. Do not install it into the pinned project environment because its Torch/Transformers dependencies differ. The script uses documented [token-prompt offline generation](https://docs.vllm.ai/en/v0.8.5/api/offline_inference/llm.html), FP32, eager mode, one GPU and a bounded batch limit. Absence of vLLM/CUDA skips with no CSV; broken installations and runtime/API errors fail visibly. Blocking generation measures whole-cohort return latency, not individual delivery; worker-process memory is unmeasured. No vLLM GPU execution or speed comparison is claimed.
+
+### CPU container and CI
+
+```bash
+docker build -t mini-infer .
+docker run --rm -p 127.0.0.1:8000:8000 -v mini-infer-cache:/app/model_cache mini-infer
+docker run --rm -v mini-infer-cache:/app/model_cache mini-infer python -m engine.generate --device cpu --prompt "Hello, world!" --max-new-tokens 50 --use-cache
+```
+
+The image downloads public weights at runtime into the mounted cache, binds its internal server to `0.0.0.0:8000`, and uses CPU/one thread. The host port command binds to loopback. No build-time weights or keys are included; local caches, weights, secrets and virtualenv are excluded from the context. CUDA containers are outside this recipe. Linux amd64 container build, 50-token CPU generation and server SSE generation passed in [hosted Docker validation](https://github.com/harshith49/mini-infer/actions/runs/38139168533/job/114469260582). Docker remains unavailable on the local Mac.
+
+[CPU CI](.github/workflows/tests.yml) installs Python 3.11 and CPU Torch, then runs the full pytest suite, including actual public GPT-2 parity and loopback HTTP checks. Downloads require internet but no secrets. [Hosted CPU validation](https://github.com/harshith49/mini-infer/actions/runs/38134037300) passed 614 tests with eight CUDA skips and two dependency deprecation warnings. An independent Docker job builds the image and checks generation plus streaming serving.
+
+### Concepts to explain in an interview
+
+- **Prefill vs decode:** prefill processes the prompt; cached decode processes one new token while attending to the prefix.
+- **Bandwidth pressure:** each decode step reads weights and growing KV state for little new work. This implementation has no hardware bandwidth profiler, so it makes no measured bandwidth-bound claim.
+- **KV growth:** each additional cached token stores keys and values in every layer; budgets reserve capacity before generation.
+- **Static vs continuous batching:** static cohorts retain slots until cohort return; continuous admission reuses finished slots between steps, with packing/copy costs.
+- **Paged allocation:** page tables allow nonconsecutive free-block reuse; rounded tails, resident pools and gather work still cost memory/time.
+- **Int8 tradeoffs:** per-output-channel scales reduce projection storage, but dequantization adds work, embeddings remain FP32 and token/quality changes require measurement.
+
+The [M8 design](docs/superpowers/specs/2026-10-11-mini-infer-m8-design.md) and [plan](docs/superpowers/plans/2026-10-11-mini-infer-m8.md) define measurement and packaging scope.

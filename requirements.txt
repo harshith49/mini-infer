@@ -7,3 +7,5 @@ starlette==1.7.0
 pydantic==2.14.0
 uvicorn==0.54.0
 httpx==0.28.1
+
+matplotlib==3.10.8
