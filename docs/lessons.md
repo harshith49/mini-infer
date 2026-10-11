@@ -180,4 +180,26 @@ Docker is unavailable here, so its CPU recipe is not claimed executed. The Colab
 
 Isolated fresh M8 measurements on Apple M5 CPU, one thread and three repetitions: naive 20.50, KV cache 118.63, static cohorts 60.15, continuous 101.79, paged 90.30, paged+int8 40.64 useful tokens/s. All rows produce 216 useful tokens; static computes 168 extras. Sequential HF pairing measured mini-infer 120.07 versus HF 114.37 tokens/s with token-exact outputs. Fresh pinned-slice perplexity is FP32 71.1282 and int8 70.1133 (1.43% lower), preserving the 5% maximum-increase gate. CPU peak and all GPU/vLLM performance remain unmeasured. Prior milestone CSVs are unchanged.
 
-Full product tree before isolated measurements: **600 passed, eight CUDA skips**, one pinned HTTPX migration warning in 132.89 seconds. No product code changed after that run; subsequent work records data and documentation. Compile/dependency/whitespace checks and a cached public-model CPU demo are acceptance checks; the final independent review follows.
+Full product tree before isolated measurements: **600 passed, eight CUDA skips**, one pinned HTTPX migration warning in 132.89 seconds. This precedes the final review fix pass described below. Compile/dependency/whitespace checks and a cached public-model CPU demo are acceptance checks.
+
+
+The single independent M8 review found two Important validation gaps, with no Critical or Minor findings. A benchmark could credit a requested budget when both its expected and actual outputs were consistently short; chart compatibility omitted recorded software and page settings. Twelve new regression cases failed before the fix. Shared `measure` now independently checks request count, one-dimensional int64 outputs and prompt-plus-budget lengths for both expected and actual tensors. Charts require matching nonempty Python/PyTorch versions, the correct per-stage cache backend, matching positive paged settings and blank page settings elsewhere. The affected/reference suite passes 55 tests with one CUDA skip. Existing recorded CSVs pass the stronger checks; their arithmetic and valid-run timing behavior did not change, so measurements were retained.
+
+M8 execution and review rulings, with their costs:
+
+- Retain the approved native checkout and manual ledger: manual bookkeeping replaces wrapper automation.
+- Retain the user's existing branch-push/draft-PR authorization: commits become public; no merge or release tag is performed.
+- CUDA execution/peaks/parity were unavailable: conditional tests cannot rule out device-specific issues.
+- Colab/T4 execution was unavailable: structural/code checks cannot rule out external-runtime problems.
+- Installed vLLM execution was unavailable: boundary checks cannot rule out API/backend incompatibility.
+- Docker execution was unavailable: recipe inspection cannot confirm a working image.
+- Hosted Actions execution was outside the independent review: local tests cannot confirm hosted-runner behavior.
+- Independent performance re-timing was excluded, and the validation-only fixes retain valid recorded runs: arithmetic/scope checks do not establish statistical reproduction.
+- The reviewer ran affected tests rather than the full inherited suite: independent coverage is narrower; executor full-suite evidence supplies integration coverage.
+- Atomic replacement does not promise power-loss durability: no fsync crash-durability guarantee.
+- New engine/server architecture is outside M8: existing behavior is retained without broader architecture validation.
+- Publication/head equality is checked separately after pushing: local acceptance alone cannot establish remote publication.
+
+No M8 Minor findings are deferred. The two inherited M6 malformed-bias/extreme-NLL limitations remain documented above.
+
+Post-review acceptance: **614 passed, eight CUDA skips**, one inherited HTTPX warning in 132.42 seconds. Compileall, pip check, whitespace and stricter chart validation pass; prior CSVs remain unchanged. Both Important findings are resolved in one executor fix pass, with no second independent review.

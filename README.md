@@ -4,7 +4,7 @@ LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that
 
 A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and honest CPU measurements. Optimizations have costs: paging can waste rounded space, reference int8 can be slower, and CPU results do not establish GPU improvements.
 
-**Current status: all eight milestones implemented; final M8 review in progress.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; streaming serving and client latency measurements are now available.
+**Current status: all eight milestones implemented; M8 review findings resolved.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; streaming serving and client latency measurements are now available.
 
 ## Quick start
 
@@ -202,7 +202,7 @@ Optional flags: `--prompt-lengths 16 64 128 256`, `--max-new-tokens 32`, `--repe
 - **int8 weight-only quantization:** store linear weights with fewer bytes. Dequantization adds work and approximation can affect quality.
 - **Streaming serving:** expose concurrent requests through a scheduler and SSE endpoint. Requires cancellation and lifecycle handling.
 
-Naive-versus-KV and fixed-cohort-versus-continuous benchmarks are implemented. Streaming serving and client load measurements are implemented. Charts, HF/vLLM comparisons, Docker, CI, and a Colab notebook remain M8 work. Later results will include hardware, workload, latency, and memory context; GPU cells will stay unmeasured until actual GPU runs.
+All eight milestones are implemented, including comparable stage/HF benchmarks, charts, an optional vLLM runner, Docker, CI and a Colab notebook. The M8 results below record hardware, workload, latency and memory scope. GPU runs, Docker execution and Colab execution remain unverified.
 
 ***HTTP rows use the text prompt and workload in the M7 section; they include delivery/parsing overhead and are single-run measurements.
 

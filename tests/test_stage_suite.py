@@ -62,7 +62,7 @@ def test_context_and_pool_validation(model, workload):
 
 
 def test_metrics_exact(workload):
-    ids = [torch.tensor([1, 2, 3])] * 3
+    ids = [torch.arange(n) for n in (3, 8, 5)]
     elapsed = iter([9., 1., 2., 3.])
     def run():
         seconds = next(elapsed)
@@ -155,3 +155,17 @@ def test_scheduler_cleanup_success(model, workload, monkeypatch):
     monkeypatch.setattr(suite.Scheduler,'close',close)
     suite.run_stage_once(model,prompts,workload,'paged_kv')
     assert closed == [0]
+
+
+@pytest.mark.parametrize('problem', ['short', 'count', 'rank', 'actual_count', 'actual_rank', 'dtype'])
+def test_measure_requires_workload_outputs(workload, problem):
+    expected = [torch.arange(n) for n in (3, 8, 5)]
+    if problem == 'short': expected = [torch.arange(n) for n in workload.prompt_lengths]
+    elif problem == 'count': expected = expected[:2]
+    elif problem == 'rank': expected = [x[None] for x in expected]
+    elif problem == 'dtype': expected = [x.float() for x in expected]
+    actual = expected
+    if problem == 'actual_count': actual = expected[:2]
+    elif problem == 'actual_rank': actual = [x[None] for x in expected]
+    with pytest.raises(RuntimeError):
+        suite.measure(lambda: suite.RunResult(actual, [1.] * len(actual), 1., 0, None), expected, workload)

@@ -14,7 +14,7 @@ from matplotlib import pyplot as plt
 
 from benchmarks.stage_suite import STAGES
 
-SHARED = ('device','hardware','threads','prompt_lengths','output_budgets','request_count',
+SHARED = ('device','hardware','python_version','torch_version','threads','prompt_lengths','output_budgets','request_count',
           'max_batch_size','seed','warmups','repetitions','workload','latency_scope')
 METRICS = ('tokens_per_second','completion_p50_seconds','completion_p95_seconds')
 
@@ -22,7 +22,8 @@ METRICS = ('tokens_per_second','completion_p50_seconds','completion_p95_seconds'
 def read_rows(path: Path) -> list[dict[str, object]]:
     with path.open(newline='') as handle:
         reader = csv.DictReader(handle)
-        required = {'stage','dtype','peak_memory_bytes','peak_memory_kind',*SHARED,*METRICS}
+        required = {'stage','dtype','peak_memory_bytes','peak_memory_kind',
+                    'cache_backend','page_size','num_pages',*SHARED,*METRICS}
         if not required.issubset(reader.fieldnames or []):
             raise ValueError('Missing six-stage CSV columns')
         rows = list(reader)
@@ -39,8 +40,17 @@ def read_rows(path: Path) -> list[dict[str, object]]:
                     or int(row['request_count'])!=len(lengths)
                     or any(int(row[k])<=0 for k in ('threads','max_batch_size','warmups','repetitions'))
                     or int(row['repetitions'])<3 or not 0<=int(row['seed'])<2**63
-                    or not row['hardware'] or not row['workload'] or not row['latency_scope']):
+                    or any(not row[k].strip() for k in ('hardware','python_version','torch_version','workload','latency_scope'))):
                 raise ValueError('Invalid workload metadata')
+            paged = row['stage'] in ('paged_kv','int8')
+            backend = 'paged' if paged else 'none' if row['stage']=='naive' else 'contiguous'
+            if row['cache_backend'] != backend:
+                raise ValueError('Unexpected stage cache backend')
+            if paged:
+                if any(int(row[k])<=0 or row[k]!=rows[-1][k] for k in ('page_size','num_pages')):
+                    raise ValueError('Invalid or incompatible page configuration')
+            elif any(row[k]!='' for k in ('page_size','num_pages')):
+                raise ValueError('Unexpected page configuration')
             expected_dtype = 'int8_weights_fp32_compute' if row['stage']=='int8' else 'fp32'
             if row['dtype']!=expected_dtype:
                 raise ValueError('Unexpected stage dtype')

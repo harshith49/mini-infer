@@ -137,10 +137,18 @@ def run_stage_once(model: GPT2Model, prompts: list[torch.Tensor], workload: Work
 
 
 def measure(run_once: Callable[[], RunResult], expected: list[torch.Tensor], workload: Workload) -> dict[str, object]:
+    lengths = [p+b for p,b in zip(workload.prompt_lengths,workload.output_budgets)]
+    def validate(outputs):
+        if (len(outputs) != len(lengths) or any(not isinstance(x,torch.Tensor)
+                or x.ndim != 1 or x.numel() != n or x.dtype != torch.long
+                for x,n in zip(outputs,lengths))):
+            raise RuntimeError('Benchmark outputs do not satisfy workload token counts')
+    validate(expected)
     expected = [x.detach().cpu() for x in expected]
     elapsed, completions, kv, peaks = [], [], [], []
     for repeat in range(workload.repetitions+1):
         result = run_once()
+        validate(result.outputs)
         if (len(result.outputs) != len(expected) or len(result.completions) != len(expected)
                 or any(not torch.equal(actual.cpu(), want) for actual,want in zip(result.outputs,expected))):
             raise RuntimeError('Benchmark output count or deterministic tokens changed')
