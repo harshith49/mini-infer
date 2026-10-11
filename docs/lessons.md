@@ -203,3 +203,5 @@ M8 execution and review rulings, with their costs:
 No M8 Minor findings are deferred. The two inherited M6 malformed-bias/extreme-NLL limitations remain documented above.
 
 Post-review acceptance: **614 passed, eight CUDA skips**, one inherited HTTPX warning in 132.42 seconds. Compileall, pip check, whitespace and stricter chart validation pass; prior CSVs remain unchanged. Both Important findings are resolved in one executor fix pass, with no second independent review.
+
+M8 is published as draft [PR #6](https://github.com/harshith49/mini-infer/pull/6), stacked on unmerged M7. The implementation commit `efcf71d0833f23513dc99264d454cfb45c6b9959` matched local, remote and PR heads before this publication record. All eight milestones are implemented on the M8 branch; no merge or release tag was performed. Final documentation heads are verified after pushing this record.
