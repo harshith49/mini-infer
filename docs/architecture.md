@@ -124,7 +124,7 @@ flowchart TD
     Release --> Queue
 ```
 
-A step snapshots the existing running set, prefills new admissions into free slots, then decodes only the old snapshot. Newly admitted rows receive one token, not two. Free slots from this step are reused next step. Zero-budget admissions use no active slot. Admission events precede decode events; completed IDs cannot be reused during one scheduler lifetime. The scheduler is synchronous, single-owner, and retains completed token results.
+A step snapshots the existing running set, prefills new admissions into free slots, then decodes only the old snapshot. Newly admitted rows receive one token, not two. Free slots from this step are reused next step. Zero-budget admissions use no active slot. Admission events precede decode events; completed IDs remain reserved until explicitly discarded or cancelled. The scheduler is synchronous, single-owner, and retains completed token results.
 
 Each private cache has batch size one and capacity `prompt length + output budget`. Admission uses a temporary cache sized to the longest prompt; only real prompt K/V is retained. In contiguous mode, a request completing on its first selected token allocates no private cache. Paged mode reserves before prefill and immediately returns those pages on completion. Decode packs left-aligned physical padding before each shorter real prefix, with zero-initialized masked slots, a full validity mask, and positions counting only valid tokens. Temporary capacity is largest committed prefix plus one. After successful logits, copy only the new column back. The final selected token is never forwarded unnecessarily.
 
@@ -172,3 +172,28 @@ flowchart LR
 Row scale is max absolute weight divided by127, with all-zero scale one and a smallest-normal FP32 floor for nonzero subnormals. Conversion uses double intermediates and rejects nonfinite sources/reconstructions. Each inference call casts the int8 matrix once and multiplies its scales in place before floating matmul. There is no persistent reconstruction cache; this is the source of measured CPU slowdown. Quantized models run through the same unmodified masks, positions, sampling and cache lifecycles.
 
 Quality scoring uses ordinary uncached model forwards over sliding windows. Each window includes context but scores only new next-token targets. Total double-precision NLL divided by target count is exponentiated once. The data URL/revision, source hash and selected token hash are recorded. The paired benchmark owns one model, finishes FP32 measurements, then converts it for int8 measurements; stage-local logits are released. Timings exclude quality, loading and conversion. Default FP32 correctness remains a separate mandatory gate.
+
+## Streaming HTTP serving (M7)
+
+```mermaid
+flowchart LR
+    HTTP[FastAPI strict request] --> Admission[Reserve stream slot]
+    Admission --> Commands[Thread-safe command queue]
+    Commands --> Owner[One model and scheduler worker]
+    Owner --> KV[Contiguous or paged private KV]
+    Owner --> Events[Bounded per-stream token and terminal events]
+    Events --> SSE[StreamingResponse SSE]
+    SSE --> Client[HTTP client]
+    Client -->|disconnect| Cleanup[Acknowledged cancellation]
+    Cleanup --> Commands
+```
+
+The worker loads the model/tokenizer once and exclusively tokenizes, submits, advances and disposes requests. The HTTP event loop never performs inference. Commands are drained between scheduler steps; an in-flight forward completes before cancellation. Idle workers block on their command queue. A fatal inference/admission fault fails the worker closed, wakes queued admissions/streams and requires restart. It adds no retry policy to the original synchronous Scheduler.
+
+Outstanding stream slots include validation, waiting, active inference and completed but undrained response queues. Each queue fits at most its finite token budget plus one terminal event. Slots remain reserved until transport closure and acknowledged disposal, so rapid disconnects cannot build unlimited pending commands. Completed Scheduler tensors/results are discarded immediately after constructing the terminal payload; a slow client retains only bounded response data. Explicit Scheduler `cancel`, `discard` and `close` also work for programmatic owners; ordinary callers retain completed results until opting into disposal.
+
+The native response has an outer cleanup wrapper because a header/send failure can occur before its generator starts. Admission monitors disconnects before returning headers; native Starlette streaming monitors subsequent disconnects under Uvicorn's ASGI 2.3 HTTP scope. Cancellation-protected cleanup tasks finish the worker handshake even if the HTTP task is cancelled. The supported `python -m server.app` launch uses a small Uvicorn shutdown hook to stop admission and wake streams before draining responses; lifespan then repeats the idempotent cleanup. After the worker joins, backend handles are detached while active responses retain their queued terminal events until transport closure. The admission guard also covers cancellation while joining its disconnect watcher, before response ownership begins. Plain `uvicorn server.app:app` does not provide that early shutdown hook. A permanently stuck PyTorch forward requires process termination.
+
+Token deltas decode cumulative generated IDs with special tokens skipped and cleanup disabled. Intermediate trailing U+FFFD characters are deferred because GPT-2 byte tokens can split Unicode; the finishing token flushes the exact final decode. Concatenated deltas equal generated text, and original prompt text is preserved separately. This bounded 1,024-token quadratic decode can become an incremental byte decoder if longer contexts justify it.
+
+`peak_forward_batch_size` counts actual attempted prefill/decode forward dimensions, including failed attempts, since scheduler startup. The SSE final result exposes it with server-lifetime scope; it is not per-request HTTP concurrency. Client timing includes network, JSON/SSE parsing and delivery. Real loopback tests establish delivery before completion, overlapping batch forwards and disconnect/shutdown cleanup; TestClient alone buffers too much to prove those properties.

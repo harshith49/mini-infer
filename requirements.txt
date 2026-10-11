@@ -2,3 +2,8 @@ torch==2.5.1
 transformers==4.48.3
 pytest==8.3.5
 safetensors==0.8.0
+fastapi==0.143.0
+starlette==1.7.0
+pydantic==2.14.0
+uvicorn==0.54.0
+httpx==0.28.1

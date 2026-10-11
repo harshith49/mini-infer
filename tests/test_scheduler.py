@@ -375,3 +375,51 @@ def test_scheduler_cli_invalid_arguments_before_loading(monkeypatch, capsys, ext
         cli.main()
     assert error.value.code == 2
     assert capsys.readouterr().err
+
+
+def test_cancel_waiting_running_completed_and_pending_events(model):
+    from engine.scheduler import Scheduler
+    s = Scheduler(model, max_batch_size=2, pad_token_id=0)
+    for name, budget in [('running', 4), ('finished', 1), ('waiting', 3)]:
+        s.submit(name, torch.tensor([1]), budget)
+    s.step()
+    s.cancel('waiting')
+    s.cancel('running')
+    s.cancel('finished')
+    s.cancel('absent')
+    assert s.idle and s.cache_allocated_bytes == 0
+    for name in ['waiting', 'running', 'finished']:
+        with pytest.raises(KeyError):
+            s.result(name)
+    s.close()
+    s.close()
+    assert s.step() == []
+
+
+def test_discard_requires_completion_and_preserves_other_results(scheduler):
+    scheduler.submit('A', torch.tensor([1]), 1)
+    scheduler.submit('B', torch.tensor([2]), 3)
+    with pytest.raises(ValueError):
+        scheduler.discard('A')
+    scheduler.step()
+    expected = scheduler.result('A')
+    assert len(expected) == 2
+    scheduler.discard('A')
+    with pytest.raises(KeyError):
+        scheduler.discard('A')
+    assert [e.request_id for e in drain(scheduler)] == ['B', 'B']
+    assert len(scheduler.result('B')) == 4
+    scheduler.close()
+
+
+def test_peak_forward_batch_counts_real_prefill_and_decode(model, scheduler):
+    batches = []
+    hook = model.register_forward_pre_hook(lambda m, a: batches.append(len(a[0])))
+    scheduler.submit('zero', torch.tensor([1]), 0)
+    scheduler.step()
+    assert scheduler.peak_forward_batch_size == 0
+    for name in ['A', 'B']:
+        scheduler.submit(name, torch.tensor([1]), 3)
+    drain(scheduler)
+    hook.remove()
+    assert scheduler.peak_forward_batch_size == max(batches) == 2
