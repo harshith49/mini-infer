@@ -202,7 +202,7 @@ Optional flags: `--prompt-lengths 16 64 128 256`, `--max-new-tokens 32`, `--repe
 - **int8 weight-only quantization:** store linear weights with fewer bytes. Dequantization adds work and approximation can affect quality.
 - **Streaming serving:** expose concurrent requests through a scheduler and SSE endpoint. Requires cancellation and lifecycle handling.
 
-All eight milestones are implemented, including comparable stage/HF benchmarks, charts, an optional vLLM runner, Docker, CI and a Colab notebook. The M8 results below record hardware, workload, latency and memory scope. GPU runs, Docker execution and Colab execution remain unverified.
+All eight milestones are implemented, including comparable stage/HF benchmarks, charts, an optional vLLM runner, Docker, CI and a Colab notebook. The M8 results below record hardware, workload, latency and memory scope. GPU and Colab execution remain unverified; hosted CPU and Docker checks passed.
 
 ***HTTP rows use the text prompt and workload in the M7 section; they include delivery/parsing overhead and are single-run measurements.
 
@@ -389,9 +389,9 @@ docker run --rm -p 127.0.0.1:8000:8000 -v mini-infer-cache:/app/model_cache mini
 docker run --rm -v mini-infer-cache:/app/model_cache mini-infer python -m engine.generate --device cpu --prompt "Hello, world!" --max-new-tokens 50 --use-cache
 ```
 
-The image downloads public weights at runtime into the mounted cache, binds its internal server to `0.0.0.0:8000`, and uses CPU/one thread. The host port command binds to loopback. No build-time weights or keys are included; local caches, weights, secrets and virtualenv are excluded from the context. CUDA containers are outside this recipe. Docker execution has not been verified here because the executable is unavailable.
+The image downloads public weights at runtime into the mounted cache, binds its internal server to `0.0.0.0:8000`, and uses CPU/one thread. The host port command binds to loopback. No build-time weights or keys are included; local caches, weights, secrets and virtualenv are excluded from the context. CUDA containers are outside this recipe. Linux amd64 container build, 50-token CPU generation and server SSE generation passed in [hosted Docker validation](https://github.com/harshith49/mini-infer/actions/runs/38139168533/job/114469260582). Docker remains unavailable on the local Mac.
 
-[CPU CI](.github/workflows/tests.yml) installs Python 3.11 and CPU Torch, then runs the full pytest suite, including actual public GPT-2 parity and loopback HTTP checks. Downloads require internet but no secrets. Local passing tests do not establish that hosted Actions have passed.
+[CPU CI](.github/workflows/tests.yml) installs Python 3.11 and CPU Torch, then runs the full pytest suite, including actual public GPT-2 parity and loopback HTTP checks. Downloads require internet but no secrets. [Hosted CPU validation](https://github.com/harshith49/mini-infer/actions/runs/38134037300) passed 614 tests with eight CUDA skips and two dependency deprecation warnings. An independent Docker job builds the image and checks generation plus streaming serving.
 
 ### Concepts to explain in an interview
 
