@@ -4,7 +4,7 @@ LLM serving wastes GPU time and memory. mini-infer is a from-scratch engine that
 
 A from-scratch GPT-2 inference engine in PyTorch, with exact Hugging Face parity checks and honest CPU measurements. Optimizations have costs: paging can waste rounded space, reference int8 can be slower, and CPU results do not establish GPU improvements.
 
-**Current status: Milestone 8 benchmarks and packaging, final verification in progress.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; streaming serving and client latency measurements are now available.
+**Current status: all eight milestones implemented; final M8 review in progress.** The custom GPT-2 transformer supports independent, fixed-batch, and FIFO continuous generation with request-owned caches, budgets, stop IDs, and seeded sampling. Public GPT-2 greedy outputs match independent engine/Hugging Face generation on CPU. Single-request KV-cache, mixed-request batching, and fixed-budget page-allocation and int8 measurements are published below; streaming serving and client latency measurements are now available.
 
 ## Quick start
 
@@ -335,11 +335,34 @@ python -m benchmarks.bench_vs_hf --device cpu
 python -m benchmarks.make_charts --input results/stages.csv
 ```
 
-The default workload uses eight seed-zero synthetic token prompts of lengths `[16,64,32,128,16,64,32,128]`, budgets `[4,32,8,64,4,32,8,64]`, batch limit two, one untimed warmup and three measured repetitions. All stages produce **216 useful new tokens** per repetition with EOS stopping disabled. Synthetic tokens measure inference mechanics, not language quality. Final six-stage measurements are pending the isolated acceptance run.
+The default workload uses eight seed-zero synthetic token prompts of lengths `[16,64,32,128,16,64,32,128]`, budgets `[4,32,8,64,4,32,8,64]`, batch limit two, one untimed warmup and three measured repetitions. All stages produce **216 useful new tokens** per repetition with EOS stopping disabled. Synthetic tokens measure inference mechanics, not language quality.
+
+Apple M5 CPU, FP32 except int8 projection storage in the final paged stage; one thread, batch limit two, three measured repetitions:
+
+| Stage | Useful tokens/s | Request p50 / p95 seconds | CPU process peak | CUDA results |
+| --- | ---: | ---: | --- | --- |
+| naive | 20.50 | 5.272 / 10.524 | Unmeasured | Unmeasured |
+| kv_cache | 118.63 | 0.950 / 1.820 | Unmeasured | Unmeasured |
+| static_batching | 60.15 | 2.080 / 3.684 | Unmeasured | Unmeasured |
+| continuous_batching | 101.79 | 1.079 / 2.118 | Unmeasured | Unmeasured |
+| paged_kv | 90.30 | 1.179 / 2.390 | Unmeasured | Unmeasured |
+| int8 | 40.64 | 2.343 / 5.310 | Unmeasured | Unmeasured |
+
+Raw data: [stages.csv](results/stages.csv). Static cohorts compute 168 extra trimmed tokens; all rows count 216 useful tokens. KV caching wins on this workload; static batching is slower than sequential cached generation, and paged/int8 stages are slower than continuous FP32. These are workload-specific CPU measurements, not GPU or general speed guarantees. Fresh quality scoring gives FP32 perplexity **71.1282**, int8 **70.1133**, a **1.43% decrease** on the pinned 4,096-target slice; this passes the 5% maximum-increase gate without establishing broader quality improvement.
+
 
 Each repetition begins at common request submission. Sequential latency ends at each request return, static latency at cohort return, and continuous latency at completion-event delivery; all include queue waiting. Tokens/s divides useful tokens by median whole-workload elapsed time. Request p50/p95 use linear interpolation over all measured repetitions. Static cohorts compute extra tokens before trimming to each budget. The last stage is **paged KV plus int8 weights**, with FP32 compute. Loading, tokenization, warmup, conversion, quality scoring and post-run comparisons are outside timers; inference validation, allocation, sampling, copies and output materialization are included.
 
 CPU process peak is **unmeasured**, including in the memory chart. CUDA peak, when measured, is PyTorch allocated tensors including the active model; driver/process totals and reserved allocator memory are excluded. KV/pool/workspace and resident model tensor bytes have separate CSV scopes. The int8 row must pass the existing checksum-pinned public-text perplexity gate (maximum 5% increase); it is compared with its own greedy warmup because quantization may change tokens. Five FP32 stages must match independent generation exactly. An error preserves the previous complete CSV rather than publishing partial stages.
+
+Measured separately on the same Apple M5 CPU workload:
+
+| Sequential cached implementation | Useful tokens/s | Request p50 / p95 seconds |
+| --- | ---: | ---: |
+| mini_infer_cached | 120.07 | 0.920 / 1.799 |
+| hf_cached | 114.37 | 0.971 / 1.888 |
+
+Raw pairing: [vs_hf.csv](results/vs_hf.csv). Both implementations pass exact-token checks. This is a three-repetition CPU measurement, not a claim of consistent superiority.
 
 The HF file is a separate paired experiment: sequential cached mini-infer versus eager FP32 `GPT2LMHeadModel.generate` on identical token prompts/budgets. Models are measured separately; both have greedy fixed outputs and matching threads/device. This is not an HF continuous scheduler comparison. Earlier milestone tables retain their original workload scope.
 
