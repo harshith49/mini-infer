@@ -1,0 +1,16 @@
+.git
+.venv
+.superpowers
+.agents
+.codex
+.aws
+.env
+.env.*
+model_cache
+**/__pycache__
+.pytest_cache
+**/*.safetensors
+**/*.bin
+**/*.pt
+**/*.pth
+results/*.png

@@ -6,6 +6,7 @@ from pathlib import Path
 import statistics
 import subprocess
 import time
+import sys
 
 import torch
 
@@ -82,6 +83,14 @@ def run_workload(model: GPT2Model, input_ids: torch.Tensor, *, max_new_tokens: i
 
 
 def main() -> None:
+    # Keep the M2 CLI and schema intact; opt into the comparable six-stage suite.
+    suite_parser = argparse.ArgumentParser(add_help=False)
+    suite_parser.add_argument('--suite', choices=('legacy', 'all'), default='legacy')
+    suite_args, remaining = suite_parser.parse_known_args()
+    if suite_args.suite == 'all':
+        from benchmarks.stage_suite import main as suite_main
+        suite_main(remaining)
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', choices=('auto', 'cpu', 'cuda'), default='auto')
     parser.add_argument('--prompt-lengths', nargs='+', type=int, default=[16, 64, 128, 256])
@@ -89,6 +98,7 @@ def main() -> None:
     parser.add_argument('--repetitions', type=int, default=3)
     parser.add_argument('--threads', type=int, default=1)
     parser.add_argument('--output', type=Path, default=Path('results/kv_cache.csv'))
+    parser.add_argument('--suite', choices=('legacy', 'all'), default='legacy', help='all: comparable six-stage workload')
     args = parser.parse_args()
     if args.threads <= 0 or args.max_new_tokens <= 0 or args.repetitions < 3:
         parser.error('Use positive threads/output length and at least three repetitions')
