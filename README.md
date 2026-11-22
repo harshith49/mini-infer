@@ -155,7 +155,7 @@ The engine uses transformers only to load weights/configuration and tokenize tex
 
 Batch checks compare each row against independent engine and HF output for 50 tokens, in cached and uncached modes, including a prompt over 128 tokens, three prompt orders, and a single-row batch. Padded full and cached suffix logits match independent references at the same tolerance. Tiny models cover fully blocked leading queries, logical positions, independent EOS completion, padding invariance, invalid inputs, cache retry metadata, and logits lifetime.
 
-On the verified CPU run, maximum absolute logit error was **0** for all three prompts. Cached token/chunk logits satisfy the same tolerance, and cached 50-token outputs match both the baseline and HF on all three prompts. The suite also tests offset causal masking, tied weights, checkpoint validation, cache capacity/byte accounting, failed-forward retry, context bounds, EOS termination, empty CLI prompts, and device selection. Public-weight tests are mandatory and fail if weights cannot be loaded. Only CUDA-specific tests skip when hardware is unavailable. CUDA numerical parity remains unverified here.
+On the verified CPU run, maximum absolute logit error was **0** for all three prompts. Cached token/chunk logits satisfy the same tolerance, and cached 50-token outputs match both the baseline and HF on all three prompts. The suite also tests offset causal masking, tied weights, checkpoint validation, cache capacity/byte accounting, failed-forward retry, context bounds, EOS termination, empty CLI prompts, and device selection. Public-weight tests are mandatory and fail if weights cannot be loaded. Only CUDA-specific tests skip when hardware is unavailable. The later T4 validation passed all eight CUDA-specific tests; see the M8 results below.
 
 Scheduler acceptance adds 50-token public greedy comparisons with active limits one/two and staggered admission. Strict public suffix-logit checks cover each request’s first eight decodes, including the long prompt, at unchanged tolerances. Longer incremental FP32 histories can differ near zero from full-prefix reductions even inside HF on Apple M5; this numerical limitation is recorded in the lessons log. Tiny-model packing checks cover every decode, and original full-forward/cached checks remain unchanged.
 
@@ -184,7 +184,7 @@ Run the same suite after every later milestone. Preserve this uncached baseline 
 | 128 | 14.56 | 108.49 | 7.45× | 11.25 |
 | 256 | 7.06 | 86.20 | 12.21× | 20.25 |
 
-Full measurements: [results/kv_cache.csv](results/kv_cache.csv), including time to first token, decode p50/p95, hardware, and thread counts. First-token times stay similar because both modes must process the prompt. CPU peak process memory is **unmeasured**, not inferred from the cache size. GPU values remain unmeasured.
+Full measurements: [results/kv_cache.csv](results/kv_cache.csv), including time to first token, decode p50/p95, hardware, and thread counts. First-token times stay similar because both modes must process the prompt. CPU peak process memory is **unmeasured**, not inferred from the cache size. This older workload has no GPU measurements; the later M8 workload has T4 results below.
 
 Run the benchmark (loading/tokenization are outside the timed intervals):
 
@@ -202,7 +202,7 @@ Optional flags: `--prompt-lengths 16 64 128 256`, `--max-new-tokens 32`, `--repe
 - **int8 weight-only quantization:** store linear weights with fewer bytes. Dequantization adds work and approximation can affect quality.
 - **Streaming serving:** expose concurrent requests through a scheduler and SSE endpoint. Requires cancellation and lifecycle handling.
 
-All eight milestones are implemented, including comparable stage/HF benchmarks, charts, an optional vLLM runner, Docker, CI and a Colab notebook. The M8 results below record hardware, workload, latency and memory scope. GPU and Colab execution remain unverified; hosted CPU and Docker checks passed.
+All eight milestones are implemented, including comparable stage/HF benchmarks, charts, an optional vLLM runner, Docker, CI and a Colab notebook. The M8 results below record hardware, workload, latency and memory scope. Hosted CPU, Docker and Colab T4 validation passed; measured GPU results appear below.
 
 ***HTTP rows use the text prompt and workload in the M7 section; they include delivery/parsing overhead and are single-run measurements.
 
@@ -215,7 +215,7 @@ Apple M5 CPU, GPT-2 FP32, one PyTorch thread, active limit two, one warmup and t
 | Static FIFO cohorts | 37.36 | 5.781 | 3343.83 / 5789.01 | 168 | 27.00 |
 | Continuous batching | 69.52 | 3.107 | 1709.90 / 3106.13 | 0 | 45.98 |
 
-Continuous batching measured **1.86× useful throughput** on this workload. The fixed-cohort comparator runs each pair to its largest budget, then trims outputs; continuous requests leave at their own budgets. This comparison does not claim a speedup on every workload. Temporary packed caches increase peak K/V storage even as fewer unnecessary tokens are computed. CPU process peak and GPU performance remain unmeasured.
+Continuous batching measured **1.86× useful throughput** on this workload. The fixed-cohort comparator runs each pair to its largest budget, then trims outputs; continuous requests leave at their own budgets. This comparison does not claim a speedup on every workload. Temporary packed caches increase peak K/V storage even as fewer unnecessary tokens are computed. CPU process peak remains unmeasured; T4 performance for the later M8 workload appears below.
 
 Completion latency begins at common workload submission and ends at cohort return or completion-event delivery; these are whole-request percentiles, separate from the M2 per-token decode figures. Timers include validation, allocation, packing, prefill, sampling, and decoding, excluding loading/tokenization. The CSV records actual K/V tensors separately from process memory.
 
@@ -255,7 +255,7 @@ An isolated Apple M5 CPU run used GPT-2, one thread, one warmup and three repeti
 | 128 | 89.02 | 24.06 | 0.27× |
 | 256 | 70.10 | 25.65 | 0.37× |
 
-**The int8 reference is slower on this CPU.** Weight storage falls from **474.70 to 232.02 MiB (51.12%)**, including scales and floating parameters and counting the tied embedding/head once. Including causal masks, resident model tensors total 486.70 versus 244.02 MiB. Maximum one-layer reconstruction is 9 MiB, an analytic temporary tensor size, not process peak. KV reservation is unchanged. CPU process/ conversion peaks and CUDA performance are unmeasured. The roadmap's int8 speed (** above) uses 128 prompt + 32 output tokens from this paired run; older milestone measurements have their own run context.
+**The int8 reference is slower on this CPU.** Weight storage falls from **474.70 to 232.02 MiB (51.12%)**, including scales and floating parameters and counting the tied embedding/head once. Including causal masks, resident model tensors total 486.70 versus 244.02 MiB. Maximum one-layer reconstruction is 9 MiB, an analytic temporary tensor size, not process peak. KV reservation is unchanged. CPU process/conversion peaks remain unmeasured; the later M8 workload includes CUDA performance. The roadmap's int8 speed (** above) uses 128 prompt + 32 output tokens from this paired run; older milestone measurements have their own run context.
 
 Quality uses a pinned, checksum-verified runtime download of [Tiny Shakespeare](https://github.com/karpathy/char-rnn/tree/370cbcd448eb7daf32f21a6be560b70e0b33c4e3/data/tinyshakespeare). The first 4,097 GPT-2 tokens produce 4,096 scored targets, context 1,024 and stride 512; overlapping context is not rescored. FP32 perplexity is **71.1282**, int8 **70.1133** (1.43% lower on this slice). This passes the planned 5% maximum increase gate, but does not establish broad quality improvement. Greedy tokens may differ from FP32.
 
@@ -339,14 +339,14 @@ The default workload uses eight seed-zero synthetic token prompts of lengths `[1
 
 Apple M5 CPU, FP32 except int8 projection storage in the final paged stage; one thread, batch limit two, three measured repetitions:
 
-| Stage | Useful tokens/s | Request p50 / p95 seconds | CPU process peak | CUDA results |
+| Stage | Useful tokens/s | Request p50 / p95 seconds | CPU process peak | T4 tokens/s |
 | --- | ---: | ---: | --- | --- |
-| naive | 20.50 | 5.272 / 10.524 | Unmeasured | Unmeasured |
-| kv_cache | 118.63 | 0.950 / 1.820 | Unmeasured | Unmeasured |
-| static_batching | 60.15 | 2.080 / 3.684 | Unmeasured | Unmeasured |
-| continuous_batching | 101.79 | 1.079 / 2.118 | Unmeasured | Unmeasured |
-| paged_kv | 90.30 | 1.179 / 2.390 | Unmeasured | Unmeasured |
-| int8 | 40.64 | 2.343 / 5.310 | Unmeasured | Unmeasured |
+| naive | 20.50 | 5.272 / 10.524 | Unmeasured | 68.13 |
+| kv_cache | 118.63 | 0.950 / 1.820 | Unmeasured | 105.74 |
+| static_batching | 60.15 | 2.080 / 3.684 | Unmeasured | 86.77 |
+| continuous_batching | 101.79 | 1.079 / 2.118 | Unmeasured | 114.56 |
+| paged_kv | 90.30 | 1.179 / 2.390 | Unmeasured | 67.68 |
+| int8 | 40.64 | 2.343 / 5.310 | Unmeasured | 60.19 |
 
 Raw data: [stages.csv](results/stages.csv). Static cohorts compute 168 extra trimmed tokens; all rows count 216 useful tokens. KV caching wins on this workload; static batching is slower than sequential cached generation, and paged/int8 stages are slower than continuous FP32. These are workload-specific CPU measurements, not GPU or general speed guarantees. Fresh quality scoring gives FP32 perplexity **71.1282**, int8 **70.1133**, a **1.43% decrease** on the pinned 4,096-target slice; this passes the 5% maximum-increase gate without establishing broader quality improvement.
 
@@ -366,9 +366,26 @@ Raw pairing: [vs_hf.csv](results/vs_hf.csv). Both implementations pass exact-tok
 
 The HF file is a separate paired experiment: sequential cached mini-infer versus eager FP32 `GPT2LMHeadModel.generate` on identical token prompts/budgets. Models are measured separately; both have greedy fixed outputs and matching threads/device. This is not an HF continuous scheduler comparison. Earlier milestone tables retain their original workload scope.
 
+### Colab T4 measurements — November 23, 2026
+
+The free Tesla T4 runtime (2026.01 image, Python 3.12.16, Torch 2.5.1+cu124) passed **622 tests, no skips**, with one inherited HTTPX warning in 901.43 seconds. All eight CUDA-specific checks ran. Primary benchmarks ran after tests and installation finished, using the same default eight requests/216 useful tokens, one thread, one warmup and three measured repetitions.
+
+| Stage | T4 tokens/s | Request p50 / p95 seconds | Peak allocated MiB including model |
+| --- | ---: | ---: | ---: |
+| naive | 68.13 | 1.622 / 3.167 | 533.96 |
+| kv_cache | 105.74 | 1.051 / 2.039 | 535.01 |
+| static_batching | 86.77 | 1.410 / 2.614 | 574.31 |
+| continuous_batching | 114.56 | 0.774 / 1.882 | 543.29 |
+| paged_kv | 67.68 | 1.396 / 3.189 | 566.52 |
+| int8 | 60.19 | 1.646 / 3.584 | 330.70 |
+
+Raw rows: [stages_cuda.csv](results/stages_cuda.csv), [vs_hf_cuda.csv](results/vs_hf_cuda.csv), [vs_vllm_cuda.csv](results/vs_vllm_cuda.csv). Separate sequential HF pairing: mini-infer **105.42** versus HF **91.79** tokens/s, token-exact. vLLM **124.55** tokens/s used its own Torch 2.6.0+cu124 environment, eager FP32 and a batch limit of two. Its blocking-cohort latency and unmeasured worker memory are different scopes; these rows do not establish general speedups. Int8 passed the same pinned-text quality gate (about 1.43% lower perplexity on this slice). Paged and int8 routes remain slower than continuous FP32 on this workload.
+
+The vLLM run needed the full `openai-community/gpt2` checkpoint name and an absolute cache path; both fixes have regression coverage. The backend emits a process-group shutdown warning on exit, but returns success with complete validated output counts. Colab output-frame rendering was unreliable, so persistent terminal logs verified completion. CPU measurements remain unchanged.
+
 ### Colab and optional vLLM
 
-Open [colab_benchmark.ipynb](notebooks/colab_benchmark.ipynb) in Colab, choose a GPU runtime and run cells in order. It creates a separate pinned virtual environment, prints actual GPU information, runs the full tests, then writes stage/HF CSVs and charts. The revision defaults to `codex/mini-infer-m8`; replace it with a reviewed SHA, or `main` after merge. Correctness failure stops benchmarks. The T4 path has not been executed here; GPU results remain unmeasured. The notebook explicitly allows a CPU-labeled fallback. Python 3.11/3.12 is required for the pinned Torch wheels.
+Open [colab_benchmark.ipynb](notebooks/colab_benchmark.ipynb) in Colab, choose a GPU runtime and run cells in order. It creates a separate pinned virtual environment, prints actual GPU information, runs the full tests, then writes stage/HF CSVs and charts. The revision defaults to `codex/mini-infer-m8`; replace it with a reviewed SHA, or `main` after merge. Correctness failure stops benchmarks. The T4 path passed 622 tests with no skips and produced the GPU measurements below. Select runtime version **2026.01** for its supported Python 3.12; the latest runtime failed the Python compatibility guard. The notebook explicitly allows a CPU-labeled fallback. Python 3.11/3.12 is required for the pinned Torch wheels.
 
 On a compatible CUDA host:
 
@@ -379,7 +396,7 @@ python -m benchmarks.bench_vs_hf --device cuda --output results/vs_hf_cuda.csv
 python -m benchmarks.make_charts --input results/stages_cuda.csv
 ```
 
-Optional vLLM uses a **separate Python 3.11 CUDA environment**, following its [0.8.5 GPU installation guide](https://docs.vllm.ai/en/v0.8.5/getting_started/installation/gpu.html). Install `vllm==0.8.5` and `httpx`, then run `python -m benchmarks.bench_vs_vllm` from this checkout. Do not install it into the pinned project environment because its Torch/Transformers dependencies differ. The script uses documented [token-prompt offline generation](https://docs.vllm.ai/en/v0.8.5/api/offline_inference/llm.html), FP32, eager mode, one GPU and a bounded batch limit. Absence of vLLM/CUDA skips with no CSV; broken installations and runtime/API errors fail visibly. Blocking generation measures whole-cohort return latency, not individual delivery; worker-process memory is unmeasured. No vLLM GPU execution or speed comparison is claimed.
+Optional vLLM uses a **separate Python 3.11/3.12 CUDA environment**, following its [0.8.5 GPU installation guide](https://docs.vllm.ai/en/v0.8.5/getting_started/installation/gpu.html). Install `vllm==0.8.5` and `httpx`, then run `python -m benchmarks.bench_vs_vllm` from this checkout. Do not install it into the pinned project environment because its Torch/Transformers dependencies differ. The script uses documented [token-prompt offline generation](https://docs.vllm.ai/en/v0.8.5/api/offline_inference/llm.html), FP32, eager mode, one GPU and a bounded batch limit. Absence of vLLM/CUDA skips with no CSV; broken installations and runtime/API errors fail visibly. Blocking generation measures whole-cohort return latency, not individual delivery; worker-process memory is unmeasured. vLLM 0.8.5 was executed on the T4 in a separate Python 3.12 environment with Torch 2.6.0+cu124; its measured row is linked below.
 
 ### CPU container and CI
 
