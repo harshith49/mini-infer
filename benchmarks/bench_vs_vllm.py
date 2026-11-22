@@ -18,7 +18,7 @@ def run_vllm(workload):
         hidden_size=cfg.n_embd,num_layers=cfg.n_layer,num_heads=cfg.n_head,
         intermediate_size=cfg.n_inner or 4*cfg.n_embd)
     prompts = make_prompts(config,workload,torch.device('cpu'))
-    engine = vllm.LLM(model='gpt2',dtype='float32',seed=workload.seed,
+    engine = vllm.LLM(model='openai-community/gpt2',dtype='float32',seed=workload.seed,
         tensor_parallel_size=1,enforce_eager=True,skip_tokenizer_init=True,
         max_model_len=config.max_positions,max_num_seqs=workload.max_batch_size,
         gpu_memory_utilization=.5,download_dir='model_cache')

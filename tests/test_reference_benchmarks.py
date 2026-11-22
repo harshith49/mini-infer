@@ -97,3 +97,14 @@ def test_reference_imports_keep_hf_cache_local(module):
     assert result.returncode == 0, result.stderr
     assert '.cache/huggingface' not in result.stderr
     assert result.stdout.strip().endswith('/model_cache/hub')
+
+
+def test_vllm_uses_namespaced_checkpoint(monkeypatch):
+    import sys
+    def engine(**kwargs):
+        assert kwargs['model'] == 'openai-community/gpt2'
+        raise RuntimeError('checkpoint verified')
+    monkeypatch.setitem(sys.modules,'vllm',SimpleNamespace(LLM=engine))
+    monkeypatch.setattr(optional.GPT2Config,'from_pretrained',lambda *a,**k: GPT2Config())
+    with pytest.raises(RuntimeError,match='checkpoint verified'):
+        optional.run_vllm(Workload())
