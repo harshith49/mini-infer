@@ -103,6 +103,8 @@ def test_vllm_uses_namespaced_checkpoint(monkeypatch):
     import sys
     def engine(**kwargs):
         assert kwargs['model'] == 'openai-community/gpt2'
+        from pathlib import Path
+        assert Path(kwargs['download_dir']).is_absolute()
         raise RuntimeError('checkpoint verified')
     monkeypatch.setitem(sys.modules,'vllm',SimpleNamespace(LLM=engine))
     monkeypatch.setattr(optional.GPT2Config,'from_pretrained',lambda *a,**k: GPT2Config())

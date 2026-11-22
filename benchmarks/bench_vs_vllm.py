@@ -1,6 +1,7 @@
 """Optional vLLM 0.8.5 offline comparison; use a separate CUDA environment."""
 import importlib.util
 import time
+from pathlib import Path
 
 import torch
 from engine.weights import GPT2Config  # Initialize the shared local HF cache boundary first.
@@ -21,7 +22,7 @@ def run_vllm(workload):
     engine = vllm.LLM(model='openai-community/gpt2',dtype='float32',seed=workload.seed,
         tensor_parallel_size=1,enforce_eager=True,skip_tokenizer_init=True,
         max_model_len=config.max_positions,max_num_seqs=workload.max_batch_size,
-        gpu_memory_utilization=.5,download_dir='model_cache')
+        gpu_memory_utilization=.5,download_dir=str(Path('model_cache').resolve()))
     inputs = [{'prompt_token_ids':p.tolist()} for p in prompts]
     sampling = [vllm.SamplingParams(temperature=0,max_tokens=b,ignore_eos=True,detokenize=False)
                 for b in workload.output_budgets]
